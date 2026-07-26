@@ -328,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Report:  {outputs.markdown}")
     print(f"JSON:    {outputs.json}")
     print(f"CSV:     {outputs.csv}  ({len(STATE.scored)} rows, one per finding)")
+    print(f"PDF:     {outputs.pdf}  (structured data only — no agent narrative)")
     print(f"State:   {state_path}")
 
     if STATE.live is not None:

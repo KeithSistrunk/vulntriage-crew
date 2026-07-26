@@ -4,6 +4,10 @@ The tables and numbers are assembled deterministically from `PipelineState`, so
 the report always reconciles with the input file. The agents' narrative sections
 are dropped in alongside them -- clearly attributed, never load-bearing for the
 data itself.
+
+Four artifacts per run: markdown to read, JSON to machine-consume, CSV for the
+spreadsheet, and a PDF to forward (`report_pdf.py` -- structured data only, no
+narrative, because a PDF travels furthest from the run that produced it).
 """
 
 from __future__ import annotations
@@ -482,6 +486,7 @@ class ReportOutputs(NamedTuple):
     markdown: Path
     json: Path
     csv: Path
+    pdf: Path
     warnings: list[str]
     guard: GuardReport
 
@@ -535,5 +540,10 @@ def write_reports(
         ),
     )
     csv_path = _record(out / "triage_report.csv", lambda p: write_csv(state, p))
+    # Imported here rather than at module scope: the PDF renderer pulls in the
+    # page-layout machinery, and nothing else in this module needs it.
+    from .report_pdf import write_pdf
 
-    return ReportOutputs(md_path, json_path, csv_path, warnings, guard)
+    pdf_path = _record(out / "triage_report.pdf", lambda p: write_pdf(state, p, top_n))
+
+    return ReportOutputs(md_path, json_path, csv_path, pdf_path, warnings, guard)
