@@ -117,9 +117,15 @@ def lookup_asset(host: str) -> AssetContext:
 # enrichment
 # --------------------------------------------------------------------------- #
 
-def enrich(finding: NormalizedFinding) -> EnrichedFinding:
-    """Attach CVE intel and asset context to a single normalized finding."""
+def enrich(finding: NormalizedFinding, live=None) -> EnrichedFinding:
+    """Attach CVE intel and asset context to a single normalized finding.
+
+    `live` is an optional `vulntriage.live.LiveIntel`. When present, its feeds
+    overlay the local database; when absent, this is exactly the POC path.
+    """
     intel = lookup_cve(finding.cve)
+    if live is not None:
+        intel = live.apply(intel)
     asset = lookup_asset(finding.fqdn or finding.hostname)
     if not asset.known_asset and finding.ip:
         asset = lookup_asset(finding.ip)
@@ -156,15 +162,23 @@ def enrich(finding: NormalizedFinding) -> EnrichedFinding:
     )
 
 
-def enrich_all(findings: list[NormalizedFinding]) -> list[EnrichedFinding]:
+def enrich_all(findings: list[NormalizedFinding], live=None) -> list[EnrichedFinding]:
     """Enrich every finding, collapsing duplicates that only host reconciliation reveals.
 
     Discovery cannot tell that `10.20.4.11` and `prod-db-01` are the same box --
     that join only exists in the CMDB. So a second dedupe pass belongs here.
+
+    When `live` is supplied its feeds are primed once for the whole CVE set --
+    one KEV download and batched EPSS beats per-finding lookups by an order of
+    magnitude, and NVD's rate limit makes it the difference between seconds and
+    minutes.
     """
+    if live is not None:
+        live.prime(f.cve for f in findings)
+
     enriched: dict[str, EnrichedFinding] = {}
     for finding in findings:
-        result = enrich(finding)
+        result = enrich(finding, live=live)
         existing = enriched.get(result.finding_id)
         if existing:
             existing.source_rows += result.source_rows

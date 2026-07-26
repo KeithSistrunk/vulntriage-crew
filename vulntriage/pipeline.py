@@ -15,12 +15,21 @@ from pathlib import Path
 
 from .intel import enrich_all
 from .models import NormalizationReport, ScoredFinding
-from .normalize import normalize_file
+from .normalize import normalize, normalize_file
 from .scoring import score_all
 from .state import STATE, PipelineState
 
 
 def run_discovery(path: str | Path, state: PipelineState = STATE) -> NormalizationReport:
+    """Discovery from whichever source the state is configured for.
+
+    The agent's tool calls this with a file path and does not know or care where
+    findings actually come from -- `--source tenable` is a run-level decision,
+    not something to re-explain to a language model.
+    """
+    if state.finding_source == "tenable" and state.tenable_client is not None:
+        return run_discovery_tenable(state.tenable_client, state)
+
     findings, report = normalize_file(path)
     state.source_file = str(path)
     state.normalized = findings
@@ -31,8 +40,25 @@ def run_discovery(path: str | Path, state: PipelineState = STATE) -> Normalizati
     return report
 
 
-def run_enrichment(state: PipelineState = STATE) -> int:
-    state.enriched = enrich_all(state.require_normalized())
+def run_discovery_tenable(client, state: PipelineState = STATE) -> NormalizationReport:
+    """Discovery against a live Tenable pull.
+
+    The client hands back raw rows in the same shape the mock export uses, so the
+    normalizer -- and every quirk it already handles -- runs unchanged. That is
+    the entire reason the Tenable client returns dicts rather than models.
+    """
+    rows = client.fetch_findings()
+    findings, report = normalize(rows, source_file=f"tenable:{client.flavor}", source_format="api")
+    state.source_file = report.source_file
+    state.normalized = findings
+    state.normalization_report = report
+    state.enriched = []
+    state.scored = []
+    return report
+
+
+def run_enrichment(state: PipelineState = STATE, live=None) -> int:
+    state.enriched = enrich_all(state.require_normalized(), live=live or state.live)
     state.scored = []
     return len(state.enriched)
 

@@ -110,6 +110,71 @@ tool call, the report says so in that agent's section instead of publishing the
 artifact — see `usable_note()` in `vulntriage/report.py`. Numbers never depend on
 the model.
 
+## Running against live data
+
+The POC ships with mock findings and a hand-curated CVE database. Both can be
+swapped for live feeds without touching the agents:
+
+```bash
+python main.py --offline --live-intel          # real KEV + EPSS + NVD, mock findings
+python main.py --source tenable --live-intel   # everything live
+python main.py --offline                       # unchanged: pure mock, no network
+```
+
+| Flag | Effect |
+|---|---|
+| `--source mock` *(default)* | findings from `data/sample_findings.json` |
+| `--source tenable` | findings pulled from the Tenable API |
+| `--live-intel` | enrich against CISA KEV, FIRST EPSS and NVD instead of `cve_db.json` |
+| `--no-cache` | bypass the on-disk intel cache and re-fetch |
+
+### Keys
+
+Copy `.env.example` to `.env` and fill in what you need. `.env` is gitignored;
+`.env.example` documents the shape and is committed.
+
+```
+TENABLE_ACCESS_KEY=      # Settings -> My Account -> API Keys
+TENABLE_SECRET_KEY=
+TENABLE_FLAVOR=io        # or "sc" for Tenable.sc
+# TENABLE_URL=           # override for Tenable.sc or a non-default region
+NVD_API_KEY=             # free: nvd.nist.gov/developers/request-an-api-key
+```
+
+**KEV and EPSS need no key.** NVD works without one but throttles to 5 requests
+per 30 seconds instead of 50 — an 18-finding cold run takes about two minutes
+unkeyed and a few seconds with a key.
+
+### What each feed contributes
+
+| Feed | Auth | Gives | Wins on |
+|---|---|---|---|
+| CISA KEV | none | confirmed in-the-wild exploitation, ransomware use | exploited-or-not, in both directions |
+| FIRST EPSS | none | probability of exploitation in the next 30 days | the exploit multiplier's graduated band |
+| NVD | free key | description, CVSS v3.1, CWE, references | the vulnerability itself |
+| Tenable | keys | the findings | what is actually on your estate |
+
+The local database still wins on **remediation guidance** — no public feed knows
+that a POS terminal cannot reboot during trading hours.
+
+### Caching
+
+`.cache/` (gitignored) holds the KEV catalogue, EPSS scores and NVD records. It
+exists for two reasons: NVD's rate limit, and reproducibility — a report that
+ranks differently because a feed refreshed mid-run is not one an analyst can
+argue with. A warm run makes **zero** NVD requests and finishes in under a
+second; the cold run that populated it made 17.
+
+### When a feed is down
+
+Intel feeds degrade: the run continues with less context and says so, on stdout
+and in `pipeline_state.json`. A total outage of all three still produces a
+complete, scored report from the local database.
+
+The findings source is different. If Tenable cannot be read there is nothing to
+degrade *to*, and quietly triaging the sample file instead would be a live run
+that is actually a mock one — so that fails with exit 2 and an explanation.
+
 ## The narrative guard
 
 Seven checks, each one a failure actually observed on an 8B run, each one decidable
@@ -296,6 +361,13 @@ vulntriage/
   report.py                    markdown + JSON + CSV report builders
   guard.py                     narrative guard — the seven grounding checks
   pipeline.py                  deterministic pipeline (the --offline path)
+  live/
+    kev.py                     CISA KEV catalogue
+    epss.py                    FIRST EPSS, batched
+    nvd.py                     NVD 2.0, cached + rate-limited
+    tenable.py                 Tenable pull -> raw rows for the normalizer
+    cache.py                   TTL'd on-disk cache for the above
+    http.py                    shared urllib fetch with retries
   tools/
     findings_loader.py         Discovery agent's tool
     cve_lookup.py              the mock CVE lookup tool
@@ -312,6 +384,7 @@ data/
 tests/
   test_pipeline.py             risk model + normalization tests
   test_guard.py                the guard's known-bad baseline
+  test_live.py                 live clients, every external call mocked
 ```
 
 ---

@@ -39,6 +39,35 @@ EXPLOIT_WEIGHTS: dict[str, float] = {
 INTERNET_FACING_WEIGHT = 1.25
 INTERNAL_WEIGHT = 1.00
 
+# EPSS -> exploit weight. A deliberate curve, not a raw multiply.
+#
+# EPSS is a probability, not a severity: 0.97 on a CVSS 4.3 does not make the bug
+# critical, it makes it imminent. Multiplying the score by the probability would
+# bury genuinely dangerous low-probability findings -- a 0.02 EPSS critical is
+# still a critical. So it is banded, it can only ever *raise* the exploit weight,
+# and it tops out at the same 1.60 as a weaponized exploit. Nothing outranks
+# confirmed in-the-wild exploitation.
+#
+# Bands are read high-to-low; the first match wins.
+EPSS_BANDS: list[tuple[float, float, str]] = [
+    (0.50, 1.60, "EPSS >= 50% - exploitation in the next 30 days is more likely than not"),
+    (0.20, 1.50, "EPSS >= 20% - heavily targeted"),
+    (0.05, 1.40, "EPSS >= 5% - meaningfully above the background rate"),
+    (0.01, 1.25, "EPSS >= 1% - some observed attacker interest"),
+]
+# Below this, EPSS says nothing useful: most CVEs sit here.
+EPSS_FLOOR = 0.01
+
+
+def epss_weight(score: float | None) -> tuple[float, str] | None:
+    """The multiplier EPSS alone would justify, or None if it says nothing."""
+    if score is None or score < EPSS_FLOOR:
+        return None
+    for threshold, weight, reason in EPSS_BANDS:
+        if score >= threshold:
+            return weight, reason
+    return None
+
 # Worst possible case: 10.0 CVSS, critical asset, weaponized, internet-facing.
 MAX_RAW_SCORE = 10.0 * max(ASSET_WEIGHTS.values()) * max(EXPLOIT_WEIGHTS.values()) * INTERNET_FACING_WEIGHT
 
@@ -75,12 +104,15 @@ def _exploit_weight(finding: EnrichedFinding) -> tuple[float, str]:
     intel = finding.intel
     maturity = intel.exploit_maturity
     weight = EXPLOIT_WEIGHTS.get(maturity, 1.0)
+    epss = epss_weight(intel.epss_score)
 
     if intel.kev:
         weight = max(weight, EXPLOIT_WEIGHTS["weaponized"])
         reason = "on the CISA KEV list - confirmed exploited in the wild"
         if intel.ransomware_campaign_use:
             reason += ", used in known ransomware campaigns"
+        if intel.epss_score is not None:
+            reason += f"; EPSS {intel.epss_score:.0%}"
         return weight, f"{reason} (x{weight:.2f})"
 
     reasons = {
@@ -90,7 +122,17 @@ def _exploit_weight(finding: EnrichedFinding) -> tuple[float, str]:
         "none": "no public exploit - theoretical or research-grade only",
         "unknown": "exploit status unknown (CVE not in the local intel DB)",
     }
-    return weight, f"{reasons.get(maturity, 'exploit status unclear')} (x{weight:.2f})"
+    reason = reasons.get(maturity, "exploit status unclear")
+
+    # EPSS can promote a finding on its own -- that is the point of it. A CVE
+    # with no published exploit but a 60% chance of being attacked this month is
+    # not a "none" risk, whatever the maturity field says.
+    if epss and epss[0] > weight:
+        weight, epss_reason = epss
+        return weight, f"{epss_reason} (x{weight:.2f}); catalogued exploit status: {reason}"
+    if intel.epss_score is not None:
+        reason += f", EPSS {intel.epss_score:.0%}"
+    return weight, f"{reason} (x{weight:.2f})"
 
 
 def _exposure_weight(finding: EnrichedFinding) -> tuple[float, str]:

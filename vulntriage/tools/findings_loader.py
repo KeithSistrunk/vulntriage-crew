@@ -7,6 +7,8 @@ from typing import Type
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 
+from ..live.http import LiveFetchError
+from ..live.tenable import TenableAuthError
 from ..pipeline import run_discovery
 from ..state import STATE
 
@@ -36,6 +38,10 @@ class LoadFindingsTool(BaseTool):
             report = run_discovery(file_path.strip().strip("'\""), STATE)
         except (FileNotFoundError, ValueError) as exc:
             return f"ERROR: {exc}"
+        except (LiveFetchError, TenableAuthError) as exc:
+            # A live pull failing must reach the agent as a readable error, not
+            # as a traceback that takes the whole crew run down with it.
+            return f"ERROR: could not read findings from Tenable: {exc}"
 
         lines = [
             f"Normalized `{report.source_file}` ({report.source_format.upper()}).",

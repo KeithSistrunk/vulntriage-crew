@@ -75,6 +75,21 @@ class CVEContext(BaseModel):
     remediation: dict[str, Any] = Field(default_factory=dict)
     notes: Optional[str] = None
 
+    # -- live intel (empty on the mock path) --------------------------------
+    epss_score: Optional[float] = Field(
+        None, ge=0.0, le=1.0,
+        description="FIRST EPSS: probability of exploitation in the next 30 days",
+    )
+    epss_percentile: Optional[float] = Field(
+        None, ge=0.0, le=1.0, description="Where that probability sits against all CVEs"
+    )
+    cwe: Optional[str] = None
+    references: list[str] = Field(default_factory=list)
+    intel_sources: list[str] = Field(
+        default_factory=list,
+        description="Which live feeds answered for this CVE. Empty means the local DB only.",
+    )
+
 
 class EnrichedFinding(NormalizedFinding):
     """Output of the Enrichment stage: normalized finding + asset + CVE context."""

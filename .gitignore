@@ -21,6 +21,9 @@ triage_report-*.csv
 logs/
 *.log
 
+# Live intel cache (KEV catalogue, EPSS scores, NVD records)
+.cache/
+
 # CrewAI local artifacts
 .crewai/
 db/

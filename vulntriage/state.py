@@ -31,7 +31,29 @@ class PipelineState:
     """Structured hand-off between pipeline stages."""
 
     def __init__(self) -> None:
+        # Run configuration: which feed findings come from and which live intel
+        # is switched on. Deliberately *not* cleared by `reset()` -- the crew
+        # resets state before it runs, and losing the source mid-run would
+        # silently drop a live pull back to the sample file.
+        self.finding_source: str = "mock"
+        self.tenable_client: Any | None = None
+        self.live: Any | None = None
         self.reset()
+
+    def configure(
+        self,
+        finding_source: str = "mock",
+        tenable_client: Any | None = None,
+        live: Any | None = None,
+    ) -> None:
+        """Point the pipeline at live sources. Called once, before discovery."""
+        self.finding_source = finding_source
+        self.tenable_client = tenable_client
+        self.live = live
+
+    @property
+    def live_warnings(self) -> list[str]:
+        return list(getattr(self.live, "warnings", []) or [])
 
     def reset(self) -> None:
         self.source_file: str | None = None

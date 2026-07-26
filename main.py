@@ -34,6 +34,13 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = ROOT / "data" / "sample_findings.json"
 DEFAULT_OUTPUT = ROOT / "output"
 
+# Imported lazily-ish: these live in vulntriage.live, which pulls in no CrewAI
+# and no third-party HTTP library, so importing it here costs nothing.
+from vulntriage.live.http import LiveFetchError  # noqa: E402
+from vulntriage.live.tenable import TenableAuthError  # noqa: E402
+
+SOURCE_ERRORS = (LiveFetchError, TenableAuthError)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -50,6 +57,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="How many findings get a full remediation write-up (default: 5)")
     parser.add_argument("--offline", action="store_true",
                         help="Run the deterministic pipeline only — no LLM, no CrewAI, no API key")
+    parser.add_argument("--source", choices=["mock", "tenable"], default="mock",
+                        help="Where findings come from: the sample export (default) or a live "
+                             "Tenable pull (needs TENABLE_ACCESS_KEY / TENABLE_SECRET_KEY)")
+    parser.add_argument("--live-intel", action="store_true",
+                        help="Enrich against live CISA KEV, FIRST EPSS and NVD instead of the "
+                             "local CVE database")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Bypass the on-disk live-intel cache and re-fetch everything")
     parser.add_argument("--provider", choices=["ollama", "openai"], default=None,
                         help="LLM backend (default: ollama, or $LLM_PROVIDER)")
     parser.add_argument("--model", default=None,
@@ -91,6 +106,48 @@ def print_summary(top_n: int) -> None:
             f"CVSS {f.effective_cvss:<5}{moved}"
         )
     print()
+
+
+def configure_sources(args: argparse.Namespace) -> int:
+    """Point STATE at whatever live feeds were asked for. Returns an exit code.
+
+    Failing to *configure* a source is fatal here -- if you asked for Tenable and
+    the keys are missing, silently triaging the sample file instead would be a
+    lie. Failing to *reach* a feed later is not: the clients degrade and the run
+    continues with less context.
+    """
+    live = None
+    if args.live_intel:
+        from vulntriage.live import EpssClient, KevClient, LiveIntel, NvdClient
+        from vulntriage.live.cache import Cache
+        from vulntriage.live.epss import EPSS_TTL_SECONDS
+        from vulntriage.live.kev import KEV_TTL_SECONDS
+        from vulntriage.live.nvd import NVD_TTL_SECONDS
+
+        use_cache = not args.no_cache
+        live = LiveIntel(
+            kev=KevClient(cache=Cache("kev", ttl_seconds=KEV_TTL_SECONDS, enabled=use_cache)),
+            epss=EpssClient(cache=Cache("epss", ttl_seconds=EPSS_TTL_SECONDS, enabled=use_cache)),
+            nvd=NvdClient(cache=Cache("nvd", ttl_seconds=NVD_TTL_SECONDS, enabled=use_cache)),
+        )
+        print("Live intel: CISA KEV + FIRST EPSS + NVD" + ("" if use_cache else " (cache bypassed)"))
+
+    client = None
+    if args.source == "tenable":
+        from vulntriage.live import TenableClient
+
+        client = TenableClient()
+        if not client.configured:
+            print(
+                "--source tenable needs TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY.\n"
+                "  Copy .env.example to .env and fill them in, or run with --source mock.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"Findings source: Tenable ({client.flavor}) at {client.base_url}")
+
+    STATE.configure(finding_source=args.source, tenable_client=client, live=live)
+    return 0
 
 
 def run_crew(args: argparse.Namespace) -> int:
@@ -158,17 +215,39 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     input_path = Path(args.input)
-    if not input_path.exists():
+    # A live Tenable pull does not read the sample file, so only require it when
+    # the mock source is actually in play.
+    if args.source == "mock" and not input_path.exists():
         print(f"Findings file not found: {input_path}", file=sys.stderr)
         return 1
 
-    if args.offline:
-        print(f"Running the deterministic pipeline on {input_path} (no LLM).")
-        run_offline(input_path, STATE)
-    else:
-        code = run_crew(args)
-        if code:
-            return code
+    code = configure_sources(args)
+    if code:
+        return code
+
+    try:
+        if args.offline:
+            origin = "Tenable" if args.source == "tenable" else str(input_path)
+            print(f"Running the deterministic pipeline on {origin} (no LLM).")
+            run_offline(input_path, STATE)
+        else:
+            code = run_crew(args)
+            if code:
+                return code
+    except SOURCE_ERRORS as exc:
+        # The findings source failing is fatal in a way the intel feeds are not:
+        # there is nothing to degrade *to*. Falling back to the sample file would
+        # silently hand back a triage of mock data labelled as a live run, so
+        # this fails loudly and cleanly instead -- a message, not a traceback.
+        print(f"\nCould not read findings from {args.source}: {exc}", file=sys.stderr)
+        if args.source == "tenable":
+            print(
+                "  Check TENABLE_ACCESS_KEY / TENABLE_SECRET_KEY, and TENABLE_URL if this is\n"
+                "  Tenable.sc or a non-default region. Run with --source mock to use the\n"
+                "  sample export instead.",
+                file=sys.stderr,
+            )
+        return 2
 
     outputs = write_reports(STATE, args.output_dir, args.top_n)
 
@@ -184,6 +263,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"CSV:     {outputs.csv}  ({len(STATE.scored)} rows, one per finding)")
     print(f"State:   {state_path}")
 
+    if STATE.live is not None:
+        print(f"Intel:   {STATE.live.summary()}")
+
     guard = outputs.guard
     print(f"Guard:   {guard.summary()}")
     for violation in guard.violations:
@@ -197,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    for warning in [*outputs.warnings, *filter(None, [state_warning])]:
+    for warning in [*STATE.live_warnings, *outputs.warnings, *filter(None, [state_warning])]:
         print(f"\nWARNING: {warning}", file=sys.stderr)
     print()
     print("Proposals only — an analyst approves before anything is changed.")
