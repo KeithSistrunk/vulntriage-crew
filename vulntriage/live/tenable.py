@@ -14,6 +14,26 @@ of it should be reimplemented here.
 Auth is the documented header form:
     X-ApiKeys: accessKey=<KEY>; secretKey=<SECRET>
 Keys come from the environment. They are never logged or written to state.
+
+A live pull is also capped (`limit`, default 20, `--limit` on the CLI). A real
+estate has thousands of findings and every one of them costs an NVD lookup during
+enrichment, so the cap is applied here -- at the pull -- rather than downstream:
+rows beyond the cap are never produced, and the plugins behind them are never
+requested at all.
+
+*What* the cap keeps matters as much as the cap itself. The workbench comes back
+in plugin order, so taking the first 20 rows off it returned 20 hosts carrying the
+same CVE-1999-0524 ICMP timestamp disclosure -- 1 of 105 plugins, every finding
+P4. A capped pull is therefore sampled, not truncated:
+
+    1. drop anything below `min_cvss` (default 7.0)
+    2. keep each CVE once, at the highest-severity plugin reporting it
+    3. walk the workbench in severity order
+    4. stop at `limit`
+
+which yields up to 20 *distinct* high-severity CVEs. The dedupe is part of the
+sampling and so applies only when a cap is in force; `min_cvss` is its own flag
+and applies either way.
 """
 
 from __future__ import annotations
@@ -23,11 +43,22 @@ import os
 from typing import Any
 
 from ..models import AssetContext
+# The severity -> CVSS fallback belongs to the normalizer; importing it keeps the
+# sampling filter and the downstream scoring reading the same table.
+from ..normalize import SEVERITY_TO_CVSS
 from .http import LiveFetchError, get_json
 
 log = logging.getLogger("vulntriage.live")
 
 TENABLE_IO_URL = "https://cloud.tenable.com"
+
+# How many findings one live pull may return. Small on purpose: this is a POC and
+# the enrichment stage makes a rate-limited NVD call per CVE. `--limit 0` lifts it.
+DEFAULT_FINDING_LIMIT = 20
+
+# The sampling floor. 7.0 is the CVSS v3 "High" boundary, so the default keeps
+# High and Critical. `--min-cvss` lowers it when too little survives.
+DEFAULT_MIN_CVSS = 7.0
 
 # Tenable severity ids line up with the Nessus 0-4 scale the normalizer expects.
 SEVERITY_NAMES = {0: "Info", 1: "Low", 2: "Medium", 3: "High", 4: "Critical"}
@@ -47,6 +78,8 @@ class TenableClient:
         access_key: str | None = None,
         secret_key: str | None = None,
         flavor: str | None = None,
+        limit: int | None = DEFAULT_FINDING_LIMIT,
+        min_cvss: float | None = DEFAULT_MIN_CVSS,
         fetch=get_json,
     ) -> None:
         self.base_url = (base_url or os.getenv("TENABLE_URL") or TENABLE_IO_URL).rstrip("/")
@@ -59,10 +92,25 @@ class TenableClient:
         self.access_key = access_key or None
         self.secret_key = secret_key or None
         self.flavor = (flavor or os.getenv("TENABLE_FLAVOR") or "io").strip().lower()
+        # None means uncapped. Anything <= 0 is read as "no cap" so `--limit 0`
+        # is an escape hatch rather than a pull that returns nothing.
+        self.limit = _coerce_limit(limit)
+        # 0 means "no floor", so `--min-cvss 0` pulls informational findings too.
+        self.min_cvss = _coerce_min_cvss(min_cvss)
         self._fetch = fetch
         self.error: str | None = None
         self.plugins_seen = 0
+        self.plugins_examined = 0
         self.plugins_without_cve = 0
+        self.plugins_below_min_cvss = 0
+        self.duplicate_cves_skipped = 0
+        self.hosts_not_sampled = 0
+        self.truncated = False
+
+    @property
+    def sampling(self) -> bool:
+        """True when the cap is in force, and with it the one-host-per-CVE dedupe."""
+        return self.limit is not None
 
     # -- auth ---------------------------------------------------------------
     @property
@@ -181,24 +229,40 @@ class TenableClient:
 
     # -- normalization ------------------------------------------------------
     def fetch_findings(self, progress=None) -> list[dict[str, Any]]:
-        """Every open finding, as raw rows in the mock export's shape.
+        """Open findings, as raw rows in the mock export's shape.
 
         Three calls per plugin would be wasteful, so the order matters: the
-        workbench summary lists the plugins, `/info` supplies the CVEs, and
-        `/outputs` supplies the hosts and ports. A plugin whose `/info` carries
-        no CVE is skipped before its outputs are ever requested -- the normalizer
-        drops CVE-less rows anyway, and on a real estate that is most of them.
+        workbench summary lists the plugins, `/info` supplies the CVEs and the v3
+        score, and `/outputs` supplies the hosts and ports. A plugin that is
+        skipped -- no CVE, below `min_cvss`, or reporting only CVEs already
+        sampled -- never costs an `/outputs` call, and on a real estate that is
+        most of them.
+
+        The sampling is enforced inside this loop rather than by filtering the
+        result, for the same reason the cap is: a capped pull against a large
+        estate should cost a handful of calls, not thousands. Walking the
+        workbench in severity order is what makes stopping early safe -- the first
+        plugin to claim a CVE is by construction the highest-severity one
+        reporting it, which is the instance the cap is meant to keep.
         """
         summary = self.fetch_vulnerabilities()
+        candidates = _by_severity(summary)
         rows: list[dict[str, Any]] = []
-        skipped_no_cve = 0
+        claimed: set[str] = set()
+        skipped_no_cve = below_floor = duplicates = crowded_out = examined = 0
+        self.truncated = False
 
-        for index, vuln in enumerate(summary, start=1):
+        for index, vuln in enumerate(candidates, start=1):
+            if self.sampling and len(claimed) >= self.limit:
+                self.truncated = True
+                break
+
             plugin = vuln.get("plugin_id") or (vuln.get("plugin") or {}).get("id")
             if plugin is None:
                 continue
             if progress:
-                progress(index, len(summary), vuln.get("plugin_name") or str(plugin))
+                progress(index, len(candidates), vuln.get("plugin_name") or str(plugin))
+            examined += 1
 
             try:
                 info = self.fetch_vulnerability_info(plugin)
@@ -211,6 +275,21 @@ class TenableClient:
                 skipped_no_cve += 1
                 continue
 
+            severity = _severity_id(vuln.get("severity", info.get("severity")))
+            cvss = _effective_cvss(vuln, info)
+            if not self._meets_floor(cvss, severity):
+                below_floor += 1
+                continue
+
+            # Each CVE is kept once. Because the walk is severity-ordered, a CVE
+            # already claimed was claimed by a plugin at least this severe, so
+            # there is nothing better here -- and no reason to spend an
+            # `/outputs` call finding that out.
+            wanted = [c for c in cves if c not in claimed] if self.sampling else list(cves)
+            duplicates += len(cves) - len(wanted)
+            if not wanted:
+                continue
+
             try:
                 outputs = self.fetch_vulnerability_outputs(plugin)
             except LiveFetchError as exc:
@@ -218,37 +297,74 @@ class TenableClient:
                 log.warning("Tenable: no outputs for plugin %s (%s)", plugin, exc)
                 continue
 
-            rows.extend(self._rows_for_plugin(vuln, plugin, cves, info, outputs))
+            for cve in wanted:
+                if self.sampling and len(claimed) >= self.limit:
+                    self.truncated = True
+                    break
+
+                found = self._rows_for_plugin(vuln, plugin, cve, info, outputs)
+                if not found:
+                    continue
+                if self.sampling:
+                    # Every host here reports the same CVE at the same severity,
+                    # so the pick is deterministic rather than meaningful -- and
+                    # the hosts it drops are counted, because "1 of 89 affected
+                    # hosts" is the sort of thing a report must not hide.
+                    found.sort(key=lambda row: str(row.get("host") or ""))
+                    crowded_out += len(found) - 1
+                    found = found[:1]
+                    claimed.add(cve)
+                rows.extend(found)
 
         self.plugins_seen = len(summary)
+        self.plugins_examined = examined
         self.plugins_without_cve = skipped_no_cve
+        self.plugins_below_min_cvss = below_floor
+        self.duplicate_cves_skipped = duplicates
+        self.hosts_not_sampled = crowded_out
         log.info(
-            "Tenable: %d plugin(s), %d without a CVE, %d raw finding row(s)",
-            len(summary), skipped_no_cve, len(rows),
+            "Tenable: %d plugin(s), %d examined, %d without a CVE, %d below CVSS %.1f, "
+            "%d duplicate CVE(s), %d row(s)%s",
+            len(summary), examined, skipped_no_cve, self.min_cvss, duplicates, len(rows),
+            f" (sampled to {self.limit})" if self.truncated else "",
         )
         return rows
+
+    def _meets_floor(self, cvss: float | None, severity: int) -> bool:
+        """Is this plugin severe enough to sample?
+
+        A plugin with no CVSS at all falls back to the band its severity implies
+        -- the same table the normalizer uses downstream. Dropping unscored rows
+        instead would quietly discard Criticals for the crime of missing a field.
+        """
+        if not self.min_cvss:
+            return True
+        if cvss is None:
+            cvss = SEVERITY_TO_CVSS.get(severity, 0.0)
+        return cvss >= self.min_cvss
 
     def _rows_for_plugin(
         self,
         vuln: dict[str, Any],
         plugin_id: Any,
-        cves: list[str],
+        cve: str,
         info: dict[str, Any],
         outputs: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        """One row per affected host, for a single CVE.
+
+        Emitting one CVE per row rather than the plugin's whole list is what makes
+        the cap mean what it says: the normalizer splits a multi-CVE row into one
+        finding per CVE, so a 20-row cap on multi-CVE rows would have handed
+        enrichment 80 lookups.
+        """
         plugin_name = (
             vuln.get("plugin_name")
             or ((info.get("plugin_details") or {}).get("name"))
             or ""
         )
         severity = _severity_id(vuln.get("severity", info.get("severity")))
-        risk = info.get("risk_information") or {}
-        cvss = _first_float(
-            risk.get("cvss3_base_score"),
-            vuln.get("cvss3_base_score"),
-            risk.get("cvss_base_score"),
-            vuln.get("cvss_base_score"),
-        )
+        cvss = _effective_cvss(vuln, info)
 
         rows: list[dict[str, Any]] = []
         for output in outputs:
@@ -267,7 +383,7 @@ class TenableClient:
                                 plugin_id=plugin_id,
                                 plugin_name=plugin_name,
                                 severity=severity,
-                                cves=cves,
+                                cves=[cve],
                                 cvss=cvss,
                                 port=port,
                                 protocol=protocol,
@@ -347,6 +463,65 @@ def acr_to_criticality(acr: Any) -> str:
     if score >= 4:
         return "medium"
     return "low"
+
+
+def _by_severity(summary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The workbench, most severe first.
+
+    Tenable returns it in plugin order, which is why an unsorted cap kept 20 hosts
+    carrying one ICMP timestamp disclosure. Ties break on the summary's CVSS and
+    then on plugin id, so the sample is reproducible run to run -- a demo that
+    reshuffles its findings between runs is not a demo of anything.
+    """
+    return sorted(
+        summary,
+        key=lambda vuln: (
+            -_severity_id(vuln.get("severity")),
+            -(_first_float(vuln.get("cvss3_base_score"), vuln.get("cvss_base_score")) or 0.0),
+            str(vuln.get("plugin_id") or ""),
+        ),
+    )
+
+
+def _effective_cvss(vuln: dict[str, Any], info: dict[str, Any]) -> float | None:
+    """The best CVSS available, v3 before v2 and `/info` before the summary."""
+    risk = info.get("risk_information") or {}
+    return _first_float(
+        risk.get("cvss3_base_score"),
+        vuln.get("cvss3_base_score"),
+        risk.get("cvss_base_score"),
+        vuln.get("cvss_base_score"),
+    )
+
+
+def _coerce_limit(value: Any) -> int | None:
+    """Normalize a cap: a positive int, or None for "no cap".
+
+    0, a negative number and anything unparseable all mean uncapped, so a bad
+    value can never turn a live pull into a silent zero-finding run.
+    """
+    if value is None:
+        return None
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return None
+    return limit if limit > 0 else None
+
+
+def _coerce_min_cvss(value: Any) -> float:
+    """Normalize the sampling floor: 0.0 means no floor.
+
+    An unparseable value falls back to the default rather than to 0.0 -- a typo
+    should not silently pull the whole informational tail of the workbench.
+    """
+    if value is None:
+        return 0.0
+    try:
+        floor = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_CVSS
+    return max(0.0, floor)
 
 
 def _first(value: Any) -> Any:

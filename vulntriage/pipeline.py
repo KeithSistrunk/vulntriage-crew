@@ -46,15 +46,66 @@ def run_discovery_tenable(client, state: PipelineState = STATE) -> Normalization
     The client hands back raw rows in the same shape the mock export uses, so the
     normalizer -- and every quirk it already handles -- runs unchanged. That is
     the entire reason the Tenable client returns dicts rather than models.
+
+    The client samples and caps the pull; this re-applies the cap to the findings
+    as a backstop, because the ceiling has to hold on what *enrichment* sees --
+    a rate-limited NVD call per CVE -- not on what the pull happened to return.
+
+    It also records the sampling in the report. A capped run is a sample of the
+    estate, and a report that does not say so reads as a clean bill of health.
     """
     rows = client.fetch_findings()
     findings, report = normalize(rows, source_file=f"tenable:{client.flavor}", source_format="api")
+    findings = _apply_limit(findings, getattr(client, "limit", None), report)
+    _note_sampling(client, report)
     state.source_file = report.source_file
     state.normalized = findings
     state.normalization_report = report
     state.enriched = []
     state.scored = []
     return report
+
+
+def _apply_limit(findings, limit, report: NormalizationReport):
+    """Trim to `limit` findings and say so in the report.
+
+    The report has to be trimmed with the findings: `normalized_findings` and
+    `hosts` are what the run summary and the narrative guard read, and leaving
+    them describing findings that were dropped would make the report claim
+    coverage the run does not have.
+    """
+    if not limit or len(findings) <= limit:
+        return findings
+
+    dropped = len(findings) - limit
+    findings = findings[:limit]
+    report.normalized_findings = len(findings)
+    report.hosts = sorted({f.hostname for f in findings})
+    report.anomalies.append(
+        f"Capped at {limit} finding(s) (--limit): {dropped} more were pulled and "
+        "discarded before enrichment. This run does not cover the whole estate."
+    )
+    return findings
+
+
+def _note_sampling(client, report: NormalizationReport) -> None:
+    """Record what the sampled pull left behind, in the report itself."""
+    limit = getattr(client, "limit", None)
+    if not limit:
+        return
+
+    report.anomalies.append(
+        f"Sampled pull: up to {limit} distinct CVE(s) at CVSS >= "
+        f"{getattr(client, 'min_cvss', 0)}, most severe first, one host per CVE. "
+        f"{getattr(client, 'plugins_examined', 0)} of {getattr(client, 'plugins_seen', 0)} "
+        "workbench plugin(s) were examined. This is a sample of the estate, not a survey."
+    )
+    crowded_out = getattr(client, "hosts_not_sampled", 0)
+    if crowded_out:
+        report.anomalies.append(
+            f"{crowded_out} further affected host(s) carry the CVEs shown and were not "
+            "sampled. Remediation scope per CVE is wider than this report's host list."
+        )
 
 
 def run_enrichment(state: PipelineState = STATE, live=None) -> int:

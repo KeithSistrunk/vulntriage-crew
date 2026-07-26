@@ -591,6 +591,319 @@ def test_the_local_cmdb_still_beats_the_scanner():
     assert enriched.asset.owner, "and it brings owner/scope the scanner lacks"
 
 
+# -- the sampled pull -------------------------------------------------------
+#
+# A real estate is thousands of findings and enrichment spends a rate-limited NVD
+# call on every CVE, so a live pull is capped. The cap has to bite at the *pull*:
+# trimming after the fact would still have paid for the enrichment.
+#
+# *What* it keeps is the other half. Against the real instance an unsampled cap
+# returned 20 hosts carrying one CVE-1999-0524 ICMP timestamp disclosure -- 1 of
+# 105 plugins, every finding P4, and nothing a triage demo can say anything about.
+# So the cap samples: CVSS floor, one host per CVE, severity order.
+
+def _big_estate_fetch(
+    plugins: int = 40,
+    hosts_per_plugin: int = 1,
+    cves_per_plugin: int = 1,
+    severity: int = 4,
+    cvss: str = "9.8",
+):
+    """A workbench with `plugins` distinct CVE-carrying plugins."""
+    requested: list[str] = []
+
+    def fetch(url, headers=None, params=None, **kwargs):
+        if "/workbenches/assets" in url:
+            return TENABLE_ASSETS
+        if "/info" in url:
+            plugin = int(url.rstrip("/info").rsplit("/", 1)[-1])
+            requested.append(url)
+            return {
+                "info": {
+                    "severity": severity,
+                    "risk_information": {"cvss3_base_score": cvss},
+                    "reference_information": [
+                        {
+                            "name": "cve",
+                            "values": [
+                                f"CVE-2026-{plugin * 10 + n:04d}"
+                                for n in range(cves_per_plugin)
+                            ],
+                        }
+                    ],
+                }
+            }
+        if "/outputs" in url:
+            requested.append(url)
+            plugin = int(url.rstrip("/outputs").rsplit("/", 1)[-1])
+            return {
+                "outputs": [
+                    {
+                        "plugin_output": "detected",
+                        "states": [
+                            {
+                                "name": "active",
+                                "results": [
+                                    {
+                                        "port": 443,
+                                        "transport_protocol": "tcp",
+                                        "assets": [
+                                            {
+                                                "hostname": f"host-{plugin}-{h}",
+                                                "fqdn": f"host-{plugin}-{h}.corp.example.net",
+                                                "ipv4": f"10.0.{plugin % 250}.{h + 1}",
+                                            }
+                                            for h in range(hosts_per_plugin)
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        if "/workbenches/vulnerabilities" in url:
+            return {
+                "vulnerabilities": [
+                    {"plugin_id": 1000 + i, "plugin_name": f"Finding {i}", "severity": severity}
+                    for i in range(plugins)
+                ]
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    return fetch, requested
+
+
+def _cves(rows) -> list[str]:
+    return [cve for row in rows for cve in row["cve"]]
+
+
+def test_a_live_pull_is_capped_at_twenty_by_default():
+    fetch, _ = _big_estate_fetch(plugins=40)
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=fetch)
+    assert client.limit == 20, "the default cap is 20, not unlimited"
+    rows = client.fetch_findings()
+    assert len(rows) == 20
+    assert client.truncated is True
+    assert client.plugins_seen == 40, "the workbench size is still reported honestly"
+
+
+def test_the_capped_set_is_twenty_distinct_cves():
+    """The headline promise: 20 different vulnerabilities, not 20 copies of one."""
+    fetch, _ = _big_estate_fetch(plugins=40, hosts_per_plugin=30)
+    rows = TenableClient(access_key="AK", secret_key="SK", fetch=fetch).fetch_findings()
+    cves = _cves(rows)
+    assert len(cves) == 20
+    assert len(set(cves)) == 20, "every sampled CVE must be distinct"
+
+
+def test_the_noisiest_plugin_cannot_fill_the_cap_on_its_own():
+    """The regression this sampling exists for.
+
+    Against the real instance the workbench's first plugin was an ICMP timestamp
+    disclosure on hundreds of hosts. Taking the head of the list spent the whole
+    cap on it: 20 findings, one CVE, all P4.
+    """
+    noisy = {"plugin_id": 10114, "plugin_name": "ICMP Timestamp Disclosure", "severity": 1}
+    base, _ = _big_estate_fetch(plugins=40, hosts_per_plugin=200)
+
+    def fetch(url, headers=None, params=None, **kwargs):
+        if "/workbenches/vulnerabilities" in url and "/info" not in url and "/outputs" not in url:
+            payload = base(url, headers, params)
+            # The noisy plugin is *first*, exactly as Tenable returns it.
+            return {"vulnerabilities": [noisy, *payload["vulnerabilities"]]}
+        if f"/{noisy['plugin_id']}/info" in url:
+            return {
+                "info": {
+                    "severity": 1,
+                    "risk_information": {"cvss3_base_score": "2.1"},
+                    "reference_information": [{"name": "cve", "values": ["CVE-1999-0524"]}],
+                }
+            }
+        return base(url, headers, params)
+
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=fetch)
+    rows = client.fetch_findings()
+
+    assert len(set(_cves(rows))) == 20
+    assert "CVE-1999-0524" not in _cves(rows), "a CVSS 2.1 finding must not survive the floor"
+    assert all(row["severity"] == 4 for row in rows), "the sample is the severe end"
+
+
+def test_findings_below_the_cvss_floor_are_dropped():
+    fetch, requested = _big_estate_fetch(plugins=10, cvss="5.4", severity=2)
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=fetch)
+    assert client.fetch_findings() == []
+    assert client.plugins_below_min_cvss == 10
+    assert not [u for u in requested if u.endswith("/outputs")], \
+        "a plugin below the floor must not cost an outputs call"
+
+
+def test_the_cvss_floor_is_configurable():
+    """`--min-cvss` is the escape hatch when the floor leaves too little."""
+    fetch, _ = _big_estate_fetch(plugins=10, cvss="5.4", severity=2)
+    client = TenableClient(access_key="AK", secret_key="SK", min_cvss=5.0, fetch=fetch)
+    assert len(client.fetch_findings()) == 10
+    assert client.min_cvss == 5.0
+
+
+def test_min_cvss_zero_removes_the_floor():
+    fetch, _ = _big_estate_fetch(plugins=5, cvss="0.0", severity=0)
+    client = TenableClient(access_key="AK", secret_key="SK", min_cvss=0, fetch=fetch)
+    assert len(client.fetch_findings()) == 5
+
+
+def test_a_plugin_with_no_cvss_is_judged_on_its_severity():
+    """Dropping unscored rows would discard Criticals for a missing field."""
+    fetch, _ = _big_estate_fetch(plugins=3, cvss="", severity=4)
+    assert len(TenableClient(access_key="AK", secret_key="SK", fetch=fetch).fetch_findings()) == 3
+
+    quiet, _ = _big_estate_fetch(plugins=3, cvss="", severity=1)
+    assert TenableClient(access_key="AK", secret_key="SK", fetch=quiet).fetch_findings() == []
+
+
+def test_one_cve_on_many_hosts_becomes_one_finding():
+    fetch, _ = _big_estate_fetch(plugins=1, hosts_per_plugin=89)
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=fetch)
+    rows = client.fetch_findings()
+    assert len(rows) == 1, "89 hosts, one CVE, one sampled finding"
+    assert client.hosts_not_sampled == 88, "and the 88 it dropped must be counted"
+
+
+def test_the_dedupe_keeps_the_highest_severity_instance_of_a_cve():
+    """Two plugins report CVE-2026-0001; the Critical one is the one to keep."""
+    shared = "CVE-2026-0001"
+    workbench = {
+        "vulnerabilities": [
+            # Listed low-severity-first, so order alone cannot get this right.
+            {"plugin_id": 200, "plugin_name": "Medium reporter", "severity": 2},
+            {"plugin_id": 100, "plugin_name": "Critical reporter", "severity": 4},
+        ]
+    }
+    info = {
+        100: {"info": {"severity": 4, "risk_information": {"cvss3_base_score": "9.8"},
+                       "reference_information": [{"name": "cve", "values": [shared]}]}},
+        200: {"info": {"severity": 2, "risk_information": {"cvss3_base_score": "7.5"},
+                       "reference_information": [{"name": "cve", "values": [shared]}]}},
+    }
+
+    def outputs_for(host):
+        return {"outputs": [{"plugin_output": host, "states": [{"name": "active", "results": [
+            {"port": 443, "transport_protocol": "tcp", "assets": [{"hostname": host}]}
+        ]}]}]}
+
+    def fetch(url, headers=None, params=None, **kwargs):
+        if "/info" in url:
+            return info[int(url.rstrip("/info").rsplit("/", 1)[-1])]
+        if "/outputs" in url:
+            plugin = int(url.rstrip("/outputs").rsplit("/", 1)[-1])
+            return outputs_for("critical-host" if plugin == 100 else "medium-host")
+        if "/workbenches/vulnerabilities" in url:
+            return workbench
+        raise AssertionError(f"unexpected URL {url}")
+
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=fetch)
+    rows = client.fetch_findings()
+    assert len(rows) == 1
+    assert rows[0]["host"] == "critical-host", "the Critical instance must win"
+    assert rows[0]["severity"] == 4
+    assert client.duplicate_cves_skipped == 1
+
+
+def test_the_cap_is_configurable():
+    fetch, _ = _big_estate_fetch(plugins=40)
+    client = TenableClient(access_key="AK", secret_key="SK", limit=5, fetch=fetch)
+    assert len(client.fetch_findings()) == 5
+
+
+def test_the_cap_stops_the_api_calls_it_does_not_just_trim_the_result():
+    """The whole point: plugins beyond the cap are never requested."""
+    fetch, requested = _big_estate_fetch(plugins=40)
+    client = TenableClient(access_key="AK", secret_key="SK", limit=5, fetch=fetch)
+    client.fetch_findings()
+
+    outputs = [u for u in requested if u.endswith("/outputs")]
+    assert len(outputs) == 5, "one plugin per sampled CVE, and no more"
+    assert client.plugins_examined == 5, "35 plugins were never touched"
+
+
+def test_a_pull_under_the_cap_is_untouched():
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=_tenable_fetch)
+    assert len(client.fetch_findings()) == 1
+    assert client.truncated is False
+
+
+def test_limit_zero_lifts_the_cap_and_the_dedupe():
+    """`--limit 0` is the full pull: every affected host, not one per CVE.
+
+    The dedupe exists to make a *sample* representative. An uncapped run is not a
+    sample, and silently hiding 88 of 89 affected hosts from it would be wrong.
+    """
+    fetch, _ = _big_estate_fetch(plugins=5, hosts_per_plugin=4)
+    client = TenableClient(access_key="AK", secret_key="SK", limit=0, fetch=fetch)
+    assert client.limit is None
+    assert client.sampling is False
+    assert len(client.fetch_findings()) == 20, "5 plugins x 4 hosts, nothing dropped"
+    assert client.truncated is False
+    assert client.hosts_not_sampled == 0
+
+
+def test_the_cvss_floor_still_applies_without_a_cap():
+    """`--min-cvss` is its own flag, not part of the cap's sampling."""
+    fetch, _ = _big_estate_fetch(plugins=5, cvss="5.4", severity=2)
+    client = TenableClient(access_key="AK", secret_key="SK", limit=0, fetch=fetch)
+    assert client.fetch_findings() == []
+
+
+def test_the_cap_holds_through_multi_cve_splitting():
+    """A plugin carrying 4 CVEs must not turn a 20-cap into 80 NVD lookups.
+
+    Enrichment is what the cap exists to bound, so it has to hold on the findings
+    the enrichment stage sees, not on the rows the pull returned.
+    """
+    from vulntriage.pipeline import run_discovery_tenable
+    from vulntriage.state import PipelineState
+
+    fetch, _ = _big_estate_fetch(plugins=40, cves_per_plugin=4)
+    client = TenableClient(access_key="AK", secret_key="SK", limit=20, fetch=fetch)
+    state = PipelineState()
+    report = run_discovery_tenable(client, state)
+
+    assert len(state.normalized) == 20, "4 CVEs a plugin must still cap at 20 findings"
+    assert len({f.cve for f in state.normalized}) == 20, "and all 20 must be distinct"
+    assert report.normalized_findings == 20, "the report must match what was kept"
+
+
+def test_a_sampled_run_says_so_in_the_report():
+    """The report is the artifact people read; the caveat has to live there too."""
+    from vulntriage.pipeline import run_discovery_tenable
+    from vulntriage.state import PipelineState
+
+    fetch, _ = _big_estate_fetch(plugins=40, hosts_per_plugin=5)
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=fetch)
+    report = run_discovery_tenable(client, PipelineState())
+
+    assert any("Sampled pull" in a for a in report.anomalies), "a sample must declare itself"
+    assert any("not sampled" in a for a in report.anomalies), \
+        "the hosts the dedupe dropped must be disclosed, not silently lost"
+
+
+def test_the_mock_path_ignores_the_sampling_entirely():
+    """Sampling is a property of the Tenable client; the sample export has none."""
+    from vulntriage.pipeline import run_discovery
+    from vulntriage.state import PipelineState
+
+    state = PipelineState()
+    report = run_discovery(SAMPLE_JSON, state)
+    assert len(state.normalized) == 18
+    assert report.normalized_findings == 18
+    assert not any("Capped" in a or "Sampled" in a for a in report.anomalies)
+    # The floor is live-pull behaviour: the mock export's low-CVSS rows survive.
+    low = [f for f in state.normalized if (f.scanner_cvss or 0) < 7.0]
+    assert low, "the sample export's sub-7.0 findings must all still be here"
+    assert any(f.cve == "CVE-2016-2183" for f in low), "the scanner-noise finding included"
+
+
 def test_tenable_one_noisy_plugin_does_not_lose_the_pull():
     def fetch(url, headers=None, params=None, **kwargs):
         if "/outputs" in url:

@@ -6,6 +6,7 @@
     python main.py --input data/sample_findings.csv
     python main.py --provider openai --model gpt-4o-mini
     python main.py --top-n 8 --verbose
+    python main.py --source tenable --limit 50    # cap the live pull (default 20)
     python main.py --strict-narrative       # fail the run if the guard flags a claim
 
 Writes `output/triage_report.md` and `output/triage_report.json`.
@@ -37,7 +38,11 @@ DEFAULT_OUTPUT = ROOT / "output"
 # Imported lazily-ish: these live in vulntriage.live, which pulls in no CrewAI
 # and no third-party HTTP library, so importing it here costs nothing.
 from vulntriage.live.http import LiveFetchError  # noqa: E402
-from vulntriage.live.tenable import TenableAuthError  # noqa: E402
+from vulntriage.live.tenable import (  # noqa: E402
+    DEFAULT_FINDING_LIMIT,
+    DEFAULT_MIN_CVSS,
+    TenableAuthError,
+)
 
 SOURCE_ERRORS = (LiveFetchError, TenableAuthError)
 
@@ -60,6 +65,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", choices=["mock", "tenable"], default="mock",
                         help="Where findings come from: the sample export (default) or a live "
                              "Tenable pull (needs TENABLE_ACCESS_KEY / TENABLE_SECRET_KEY)")
+    parser.add_argument("--limit", type=int, default=DEFAULT_FINDING_LIMIT,
+                        help=f"Cap a live Tenable pull at this many distinct CVEs "
+                             f"(default: {DEFAULT_FINDING_LIMIT}, 0 for no cap). Applied at the "
+                             f"pull, so nothing beyond the cap is enriched. No effect on "
+                             f"--source mock.")
+    parser.add_argument("--min-cvss", type=float, default=DEFAULT_MIN_CVSS,
+                        help=f"Drop live findings below this CVSS before the cap is applied "
+                             f"(default: {DEFAULT_MIN_CVSS}, 0 for no floor). Lower it if too "
+                             f"few findings survive.")
     parser.add_argument("--live-intel", action="store_true",
                         help="Enrich against live CISA KEV, FIRST EPSS and NVD instead of the "
                              "local CVE database")
@@ -95,6 +109,21 @@ def print_summary(top_n: int) -> None:
             f"{report.dropped_not_open} already remediated, {report.duplicates_collapsed} duplicates "
             f"collapsed, {report.multi_cve_rows_split} multi-CVE rows split)"
         )
+    # A capped run is a sample of the estate, not a survey of it. Saying so next
+    # to the counts is the difference between a demo and a misleading report.
+    client = STATE.tenable_client
+    if client is not None and getattr(client, "limit", None):
+        cap = "capped" if client.truncated else "under the cap"
+        print(
+            f"Sampled: {len(scored)} distinct CVE(s) at CVSS >= {client.min_cvss} ({cap} at "
+            f"{client.limit}) — {client.plugins_examined} of {client.plugins_seen} workbench "
+            f"plugin(s) examined, {client.plugins_below_min_cvss} below the floor."
+        )
+        if client.hosts_not_sampled:
+            print(
+                f"         {client.hosts_not_sampled} further affected host(s) share these "
+                f"CVEs and were not sampled. One host per CVE is shown."
+            )
     print("Priority: " + "  ".join(f"{p}={counts.get(p, 0)}" for p in ("P1", "P2", "P3", "P4")))
     print()
     print(f"Top {min(top_n, len(scored))} by risk:")
@@ -151,7 +180,7 @@ def configure_sources(args: argparse.Namespace) -> int:
     if args.source == "tenable":
         from vulntriage.live import TenableClient
 
-        client = TenableClient()
+        client = TenableClient(limit=args.limit, min_cvss=args.min_cvss)
         if not client.configured:
             print(
                 "--source tenable needs TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY.\n"
@@ -160,6 +189,12 @@ def configure_sources(args: argparse.Namespace) -> int:
             )
             return 2
         print(f"Findings source: Tenable ({client.flavor}) at {client.base_url}")
+        floor = f"CVSS >= {client.min_cvss}" if client.min_cvss else "no CVSS floor"
+        if client.limit:
+            print(f"  Sampling: {floor}, one host per CVE, most severe first, "
+                  f"up to {client.limit} distinct CVEs")
+        else:
+            print(f"  Sampling: {floor}, no cap — every affected host")
 
     # Asset criticality from the scanner. Without it every live finding scores at
     # the neutral asset weight, and the ranking collapses toward a CVSS sort --
