@@ -1,0 +1,8 @@
+# VulnTriage POC dependencies.
+#
+# The deterministic pipeline (`python main.py --offline`) needs only pydantic.
+# CrewAI is required for the agent path (`python main.py`).
+
+crewai>=0.130.0,<2.0.0
+pydantic>=2.7,<3.0
+python-dotenv>=1.0.0

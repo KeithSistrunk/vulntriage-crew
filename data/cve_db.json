@@ -1,0 +1,586 @@
+{
+  "_meta": {
+    "source": "Mock CVE intelligence database for the VulnTriage POC.",
+    "note": "Hand-curated snapshot of well-known CVEs. Scores follow NVD CVSS v3.x. Replace with a live NVD / CISA KEV feed — see FUTURE_ADDONS.md items 2 and 3.",
+    "snapshot_date": "2026-07-01"
+  },
+  "cves": {
+    "CVE-2021-44228": {
+      "id": "CVE-2021-44228",
+      "name": "Log4Shell",
+      "published": "2021-12-10",
+      "description": "Apache Log4j2 JNDI features used in configuration, log messages and parameters do not protect against attacker-controlled LDAP endpoints. An attacker who can control log messages can execute arbitrary code loaded from a remote server.",
+      "cwe": "CWE-502 Deserialization of Untrusted Data",
+      "cvss_v3": {
+        "score": 10.0,
+        "severity": "Critical",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+      },
+      "affected": "Apache Log4j 2.0-beta9 through 2.14.1",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2021-12-10",
+        "ransomware_campaign_use": true,
+        "notes": "Mass-exploited within 48 hours of disclosure. Trivial one-line payload; scanned for continuously by opportunistic botnets."
+      },
+      "remediation": {
+        "summary": "Upgrade Log4j to 2.17.1 or later.",
+        "steps": [
+          "Inventory every JVM app on the host for bundled log4j-core jars (including shaded/fat jars).",
+          "Upgrade log4j-core to 2.17.1+ and rebuild/redeploy the application.",
+          "If an immediate upgrade is impossible, remove the JndiLookup class from the jar as a stopgap: zip -q -d log4j-core-*.jar org/apache/logging/log4j/core/lookup/JndiLookup.class",
+          "Restart the JVM service and re-scan to confirm the plugin no longer fires."
+        ],
+        "type": "patch",
+        "effort": "medium",
+        "requires_reboot": false,
+        "requires_downtime": true,
+        "change_risk": "medium"
+      }
+    },
+    "CVE-2020-1472": {
+      "id": "CVE-2020-1472",
+      "name": "Zerologon",
+      "published": "2020-08-11",
+      "description": "An elevation of privilege flaw in the Netlogon Remote Protocol (MS-NRPC). An unauthenticated attacker with network access to a domain controller can set the DC machine account password to an empty value and take over the domain.",
+      "cwe": "CWE-330 Use of Insufficiently Random Values",
+      "cvss_v3": {
+        "score": 10.0,
+        "severity": "Critical",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+      },
+      "affected": "Windows Server 2008 R2 through 2019 domain controllers",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2021-11-03",
+        "ransomware_campaign_use": true,
+        "notes": "Public Impacket/Mimikatz modules. Standard step in ransomware domain-takeover playbooks."
+      },
+      "remediation": {
+        "summary": "Apply the August 2020 (or later) cumulative update and move DCs to enforcement mode.",
+        "steps": [
+          "Install the August 2020+ Windows cumulative update on every domain controller.",
+          "Monitor Event IDs 5827-5831 for legacy devices still using vulnerable Netlogon connections.",
+          "Set the FullSecureChannelProtection registry value to 1 (enforcement mode) once the noise is clear.",
+          "Reboot the DC and confirm secure channel enforcement."
+        ],
+        "type": "patch",
+        "effort": "medium",
+        "requires_reboot": true,
+        "requires_downtime": true,
+        "change_risk": "high"
+      }
+    },
+    "CVE-2019-0708": {
+      "id": "CVE-2019-0708",
+      "name": "BlueKeep",
+      "published": "2019-05-14",
+      "description": "A pre-authentication remote code execution vulnerability in Remote Desktop Services. An unauthenticated attacker can send crafted requests over RDP and execute arbitrary code. The flaw is wormable.",
+      "cwe": "CWE-416 Use After Free",
+      "cvss_v3": {
+        "score": 9.8,
+        "severity": "Critical",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+      },
+      "affected": "Windows 7, Server 2008, Server 2008 R2 (and XP/2003 out-of-band patch)",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2021-11-03",
+        "ransomware_campaign_use": true,
+        "notes": "Reliable public Metasploit module. Wormable - a single exposed host puts the whole segment at risk."
+      },
+      "remediation": {
+        "summary": "Patch RDP, and require Network Level Authentication in the interim.",
+        "steps": [
+          "Apply the May 2019 RDP security update for the host OS build.",
+          "Enable Network Level Authentication (NLA) on Remote Desktop Services - it blocks the pre-auth path.",
+          "Restrict TCP/3389 to jump hosts at the firewall; RDP should never be broadly reachable.",
+          "Reboot and re-scan."
+        ],
+        "type": "patch",
+        "effort": "medium",
+        "requires_reboot": true,
+        "requires_downtime": true,
+        "change_risk": "medium"
+      }
+    },
+    "CVE-2017-0144": {
+      "id": "CVE-2017-0144",
+      "name": "EternalBlue (MS17-010)",
+      "published": "2017-03-16",
+      "description": "The SMBv1 server in Microsoft Windows mishandles specially crafted packets, allowing remote attackers to execute arbitrary code. Used by the WannaCry and NotPetya worms.",
+      "cwe": "CWE-20 Improper Input Validation",
+      "cvss_v3": {
+        "score": 8.1,
+        "severity": "High",
+        "vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H"
+      },
+      "affected": "Windows SMBv1 (Vista through Server 2016 pre-MS17-010)",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2022-03-03",
+        "ransomware_campaign_use": true,
+        "notes": "Shadow Brokers leak. Fully weaponized, wormable, and still the most common lateral-movement path on flat networks."
+      },
+      "remediation": {
+        "summary": "Apply MS17-010 and disable SMBv1 entirely.",
+        "steps": [
+          "Apply the MS17-010 security update for the host build.",
+          "Disable SMBv1: Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol",
+          "Confirm no legacy application or scanner/copier depends on SMBv1 before disabling.",
+          "Reboot and re-scan."
+        ],
+        "type": "patch",
+        "effort": "low",
+        "requires_reboot": true,
+        "requires_downtime": true,
+        "change_risk": "medium"
+      }
+    },
+    "CVE-2022-22965": {
+      "id": "CVE-2022-22965",
+      "name": "Spring4Shell",
+      "published": "2022-04-01",
+      "description": "Spring MVC and Spring WebFlux applications running on JDK 9+ are vulnerable to remote code execution via data binding. An attacker can manipulate ClassLoader properties to write a web shell to disk.",
+      "cwe": "CWE-94 Improper Control of Generation of Code",
+      "cvss_v3": {
+        "score": 9.8,
+        "severity": "Critical",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+      },
+      "affected": "Spring Framework 5.3.0-5.3.17 and 5.2.0-5.2.19 on JDK 9+ deployed as a WAR on Tomcat",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2022-04-04",
+        "ransomware_campaign_use": false,
+        "notes": "Public exploit drops a JSP web shell in one request. Actively scanned for on internet-facing Tomcat."
+      },
+      "remediation": {
+        "summary": "Upgrade Spring Framework to 5.3.18 / 5.2.20 or later.",
+        "steps": [
+          "Upgrade Spring Framework to 5.3.18+ (or 5.2.20+) and Spring Boot to 2.6.6+ / 2.5.12+.",
+          "Rebuild and redeploy the WAR.",
+          "If the upgrade is blocked, add a ControllerAdvice that blacklists the class.module.classLoader.* binding paths.",
+          "Restart Tomcat and verify the exploit path returns 400."
+        ],
+        "type": "patch",
+        "effort": "medium",
+        "requires_reboot": false,
+        "requires_downtime": true,
+        "change_risk": "medium"
+      }
+    },
+    "CVE-2017-5638": {
+      "id": "CVE-2017-5638",
+      "name": "Apache Struts 2 Jakarta Multipart RCE",
+      "published": "2017-03-10",
+      "description": "The Jakarta Multipart parser in Apache Struts 2 mishandles the Content-Type header, allowing remote command execution via a crafted OGNL expression. This is the flaw behind the 2017 Equifax breach.",
+      "cwe": "CWE-20 Improper Input Validation",
+      "cvss_v3": {
+        "score": 10.0,
+        "severity": "Critical",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+      },
+      "affected": "Apache Struts 2.3.5-2.3.31 and 2.5-2.5.10",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2021-11-03",
+        "ransomware_campaign_use": false,
+        "notes": "Single-header curl exploit. Continuously scanned for; responsible for the Equifax breach of 147M records."
+      },
+      "remediation": {
+        "summary": "Upgrade Struts to 2.3.32 / 2.5.10.1 or later.",
+        "steps": [
+          "Upgrade Apache Struts to 2.3.32+ or 2.5.10.1+.",
+          "If the app is end-of-life, put a WAF rule in front that rejects OGNL expressions in Content-Type as an interim control.",
+          "Rebuild, redeploy, and confirm with a benign Content-Type probe.",
+          "Review web/app logs for prior exploitation - this CVE is old enough that compromise should be assumed until disproven."
+        ],
+        "type": "patch",
+        "effort": "high",
+        "requires_reboot": false,
+        "requires_downtime": true,
+        "change_risk": "high"
+      }
+    },
+    "CVE-2019-11043": {
+      "id": "CVE-2019-11043",
+      "name": "PHP-FPM / nginx env_path_info RCE",
+      "published": "2019-10-28",
+      "description": "An underflow in fpm_main.c allows remote code execution on nginx + PHP-FPM deployments using a particular regex-based fastcgi_split_path_info configuration.",
+      "cwe": "CWE-787 Out-of-bounds Write",
+      "cvss_v3": {
+        "score": 9.8,
+        "severity": "Critical",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+      },
+      "affected": "PHP 7.1.x < 7.1.33, 7.2.x < 7.2.24, 7.3.x < 7.3.11 with nginx fastcgi_split_path_info",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2021-11-03",
+        "ransomware_campaign_use": false,
+        "notes": "Public phuip-fpizdam tool exploits this reliably against the default nginx recipe."
+      },
+      "remediation": {
+        "summary": "Upgrade PHP and fix the nginx fastcgi_split_path_info regex.",
+        "steps": [
+          "Upgrade PHP to 7.3.11 / 7.2.24 / 7.1.33 or later.",
+          "Anchor the nginx regex: fastcgi_split_path_info ^(.+?\\.php)(/.*)$; and add try_files $fastcgi_script_name =404;",
+          "Reload nginx and restart php-fpm.",
+          "Re-scan to confirm."
+        ],
+        "type": "patch",
+        "effort": "low",
+        "requires_reboot": false,
+        "requires_downtime": false,
+        "change_risk": "low"
+      }
+    },
+    "CVE-2023-4863": {
+      "id": "CVE-2023-4863",
+      "name": "libwebp heap buffer overflow",
+      "published": "2023-09-12",
+      "description": "A heap buffer overflow in the WebP image decoder (libwebp) allows an attacker to perform an out-of-bounds memory write via a crafted WebP image. Reachable from any application that decodes untrusted images.",
+      "cwe": "CWE-787 Out-of-bounds Write",
+      "cvss_v3": {
+        "score": 8.8,
+        "severity": "High",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H"
+      },
+      "affected": "libwebp before 1.3.2 and everything that vendors it (browsers, Electron apps, image pipelines)",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2023-09-13",
+        "ransomware_campaign_use": false,
+        "notes": "Exploited in the wild as a zero-day in a commercial spyware chain before disclosure."
+      },
+      "remediation": {
+        "summary": "Update libwebp to 1.3.2+ and rebuild anything that statically links it.",
+        "steps": [
+          "Update the OS libwebp package to 1.3.2 or later.",
+          "Identify applications that statically link or vendor libwebp (Electron apps, Node image tooling, browsers) - the OS package alone does not fix those.",
+          "Rebuild or update those applications.",
+          "Restart affected services."
+        ],
+        "type": "patch",
+        "effort": "medium",
+        "requires_reboot": false,
+        "requires_downtime": false,
+        "change_risk": "low"
+      }
+    },
+    "CVE-2021-34527": {
+      "id": "CVE-2021-34527",
+      "name": "PrintNightmare",
+      "published": "2021-07-01",
+      "description": "The Windows Print Spooler service improperly performs privileged file operations, allowing an authenticated remote attacker to run arbitrary code with SYSTEM privileges and install drivers.",
+      "cwe": "CWE-269 Improper Privilege Management",
+      "cvss_v3": {
+        "score": 8.8,
+        "severity": "High",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H"
+      },
+      "affected": "All supported Windows versions running the Print Spooler service",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2021-11-03",
+        "ransomware_campaign_use": true,
+        "notes": "Public Impacket and PowerShell exploits. Common privilege-escalation step after initial access."
+      },
+      "remediation": {
+        "summary": "Patch, then disable the Print Spooler anywhere printing is not required.",
+        "steps": [
+          "Apply the July 2021+ cumulative update.",
+          "Set the RestrictDriverInstallationToAdministrators registry value to 1.",
+          "Disable the Print Spooler service on servers that do not print (domain controllers especially): Stop-Service Spooler; Set-Service Spooler -StartupType Disabled",
+          "For POS and kiosk endpoints that DO print, keep the spooler but confirm the driver-install restriction is in force."
+        ],
+        "type": "patch+config",
+        "effort": "low",
+        "requires_reboot": true,
+        "requires_downtime": true,
+        "change_risk": "medium"
+      }
+    },
+    "CVE-2020-0796": {
+      "id": "CVE-2020-0796",
+      "name": "SMBGhost",
+      "published": "2020-03-12",
+      "description": "A buffer overflow in the way SMBv3.1.1 handles compressed message requests allows an unauthenticated remote attacker to execute code on the SMB server. Wormable.",
+      "cwe": "CWE-119 Improper Restriction of Operations within the Bounds of a Memory Buffer",
+      "cvss_v3": {
+        "score": 10.0,
+        "severity": "Critical",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+      },
+      "affected": "Windows 10 / Server 1903 and 1909 with SMBv3 compression",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2021-11-03",
+        "ransomware_campaign_use": false,
+        "notes": "Public RCE and local privilege escalation exploits available."
+      },
+      "remediation": {
+        "summary": "Apply KB4551762; disable SMBv3 compression as an interim control.",
+        "steps": [
+          "Apply the March 2020 out-of-band update (KB4551762).",
+          "Interim: disable SMBv3 compression - Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters' DisableCompression -Type DWORD -Value 1 -Force",
+          "Block TCP/445 at the branch firewall from anything but the file-server VLAN.",
+          "Reboot and re-scan."
+        ],
+        "type": "patch",
+        "effort": "low",
+        "requires_reboot": true,
+        "requires_downtime": true,
+        "change_risk": "medium"
+      }
+    },
+    "CVE-2021-4034": {
+      "id": "CVE-2021-4034",
+      "name": "PwnKit",
+      "published": "2022-01-25",
+      "description": "A memory corruption flaw in polkit's pkexec utility allows any unprivileged local user to gain full root privileges on a default installation.",
+      "cwe": "CWE-787 Out-of-bounds Write",
+      "cvss_v3": {
+        "score": 7.8,
+        "severity": "High",
+        "vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+      },
+      "affected": "polkit pkexec on essentially every Linux distribution shipped since 2009",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2022-06-27",
+        "ransomware_campaign_use": false,
+        "notes": "Dozens of reliable public one-file exploits. Default post-exploitation privilege escalation on Linux."
+      },
+      "remediation": {
+        "summary": "Update the polkit package.",
+        "steps": [
+          "Update polkit via the OS package manager (yum update polkit / apt install --only-upgrade policykit-1).",
+          "If patching is blocked, strip the setuid bit as a stopgap: chmod 0755 /usr/bin/pkexec",
+          "No reboot required; new logins pick up the fixed binary immediately.",
+          "Re-scan to confirm."
+        ],
+        "type": "patch",
+        "effort": "low",
+        "requires_reboot": false,
+        "requires_downtime": false,
+        "change_risk": "low"
+      }
+    },
+    "CVE-2014-0160": {
+      "id": "CVE-2014-0160",
+      "name": "Heartbleed",
+      "published": "2014-04-07",
+      "description": "The TLS heartbeat extension in OpenSSL does not validate the payload length, allowing a remote attacker to read up to 64KB of process memory per request - potentially private keys, session tokens, and credentials.",
+      "cwe": "CWE-125 Out-of-bounds Read",
+      "cvss_v3": {
+        "score": 7.5,
+        "severity": "High",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+      },
+      "affected": "OpenSSL 1.0.1 through 1.0.1f",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2022-05-04",
+        "ransomware_campaign_use": false,
+        "notes": "Trivial, silent, and leaves no application log trace. Any exposure implies possible key and session-token theft."
+      },
+      "remediation": {
+        "summary": "Update OpenSSL, then rotate every key and secret the host ever held.",
+        "steps": [
+          "Update OpenSSL to 1.0.1g or later (or rebuild with -DOPENSSL_NO_HEARTBEATS).",
+          "Restart every service linked against the old library.",
+          "Reissue the TLS certificate with a NEW private key and revoke the old certificate.",
+          "Rotate credentials and invalidate all active sessions - assume memory was read."
+        ],
+        "type": "patch+rotate-secrets",
+        "effort": "high",
+        "requires_reboot": false,
+        "requires_downtime": true,
+        "change_risk": "medium"
+      }
+    },
+    "CVE-2023-44487": {
+      "id": "CVE-2023-44487",
+      "name": "HTTP/2 Rapid Reset",
+      "published": "2023-10-10",
+      "description": "The HTTP/2 protocol allows a client to rapidly open and cancel streams (RST_STREAM), letting a small number of connections consume disproportionate server resources. Used for record-breaking denial-of-service attacks.",
+      "cwe": "CWE-400 Uncontrolled Resource Consumption",
+      "cvss_v3": {
+        "score": 7.5,
+        "severity": "High",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      },
+      "affected": "Most HTTP/2 implementations prior to the October 2023 mitigations (nginx, Apache, Envoy, Netty, Go, .NET)",
+      "exploit": {
+        "maturity": "weaponized",
+        "kev": true,
+        "kev_date_added": "2023-10-10",
+        "ransomware_campaign_use": false,
+        "notes": "Exploited in the wild for 398M rps DDoS. Availability-only impact - no data exposure."
+      },
+      "remediation": {
+        "summary": "Update the HTTP/2 server and cap concurrent streams / reset rate.",
+        "steps": [
+          "Update nginx to 1.25.3+ (or the vendor's patched build for your stack).",
+          "Set http2_max_concurrent_streams to 128 and keepalive_requests to 1000.",
+          "Enable the rapid-reset mitigation at the CDN/WAF edge if one is in front of this host.",
+          "Reload the service - no downtime required."
+        ],
+        "type": "patch+config",
+        "effort": "low",
+        "requires_reboot": false,
+        "requires_downtime": false,
+        "change_risk": "low"
+      }
+    },
+    "CVE-2018-15473": {
+      "id": "CVE-2018-15473",
+      "name": "OpenSSH username enumeration",
+      "published": "2018-08-17",
+      "description": "OpenSSH is vulnerable to user enumeration through a timing and response difference when a malformed authentication packet is sent for a non-existent versus an existing user.",
+      "cwe": "CWE-362 Race Condition / observable discrepancy",
+      "cvss_v3": {
+        "score": 5.3,
+        "severity": "Medium",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+      },
+      "affected": "OpenSSH through 7.7",
+      "exploit": {
+        "maturity": "poc",
+        "kev": false,
+        "kev_date_added": null,
+        "ransomware_campaign_use": false,
+        "notes": "Public Python PoC and a Metasploit auxiliary module. Not RCE - but it is the reconnaissance step that makes credential stuffing against an internet-facing SSH service cheap and quiet."
+      },
+      "remediation": {
+        "summary": "Upgrade OpenSSH to 7.8+ and take SSH off the public internet.",
+        "steps": [
+          "Upgrade OpenSSH to 7.8 or later.",
+          "Restrict TCP/22 to the jump-host / VPN range - an internet-facing SSH service is the real finding here.",
+          "Disable password authentication (PasswordAuthentication no) so enumeration yields nothing usable.",
+          "Reload sshd."
+        ],
+        "type": "patch+config",
+        "effort": "low",
+        "requires_reboot": false,
+        "requires_downtime": false,
+        "change_risk": "low"
+      }
+    },
+    "CVE-2023-38545": {
+      "id": "CVE-2023-38545",
+      "name": "curl SOCKS5 heap buffer overflow",
+      "published": "2023-10-11",
+      "description": "A heap buffer overflow in curl's SOCKS5 proxy handshake. When curl is told to use a SOCKS5 proxy with hostname resolution and the hostname exceeds 255 bytes, it can overflow a heap buffer.",
+      "cwe": "CWE-787 Out-of-bounds Write",
+      "cvss_v3": {
+        "score": 9.8,
+        "severity": "Critical",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+      },
+      "affected": "libcurl 7.69.0 through 8.3.0",
+      "exploit": {
+        "maturity": "poc",
+        "kev": false,
+        "kev_date_added": null,
+        "ransomware_campaign_use": false,
+        "notes": "Heavily hyped at disclosure but exploitation requires a very specific configuration: SOCKS5 proxy mode with remote hostname resolution AND attacker control of the target hostname. Rarely reachable in practice."
+      },
+      "remediation": {
+        "summary": "Update curl/libcurl to 8.4.0 or later.",
+        "steps": [
+          "Update the curl and libcurl packages to 8.4.0+.",
+          "Confirm no application on the host uses a SOCKS5 proxy with remote hostname resolution - if none do, the flaw is not reachable and this can ride a normal patch cycle.",
+          "Restart long-running processes that link libcurl.",
+          "Re-scan."
+        ],
+        "type": "patch",
+        "effort": "low",
+        "requires_reboot": false,
+        "requires_downtime": false,
+        "change_risk": "low"
+      }
+    },
+    "CVE-2022-0778": {
+      "id": "CVE-2022-0778",
+      "name": "OpenSSL BN_mod_sqrt infinite loop",
+      "published": "2022-03-15",
+      "description": "The BN_mod_sqrt() function can loop forever on non-prime moduli. Parsing a certificate with a crafted elliptic curve parameter triggers the loop, causing a denial of service.",
+      "cwe": "CWE-835 Infinite Loop",
+      "cvss_v3": {
+        "score": 7.5,
+        "severity": "High",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      },
+      "affected": "OpenSSL 1.0.2 through 1.0.2zc, 1.1.1 through 1.1.1n, 3.0.0 through 3.0.1",
+      "exploit": {
+        "maturity": "poc",
+        "kev": false,
+        "kev_date_added": null,
+        "ransomware_campaign_use": false,
+        "notes": "PoC certificate available. Denial of service only - no code execution, no data exposure. Only reachable on services that parse client-supplied certificates."
+      },
+      "remediation": {
+        "summary": "Update OpenSSL to 1.1.1n / 3.0.2 or later on the next patch cycle.",
+        "steps": [
+          "Update the OpenSSL package to 1.1.1n, 3.0.2, or 1.0.2zd (premium support).",
+          "Restart services linked against OpenSSL.",
+          "No urgency on an internal build host that does not parse untrusted client certificates - schedule with normal monthly patching."
+        ],
+        "type": "patch",
+        "effort": "low",
+        "requires_reboot": false,
+        "requires_downtime": false,
+        "change_risk": "low"
+      }
+    },
+    "CVE-2016-2183": {
+      "id": "CVE-2016-2183",
+      "name": "SWEET32 (64-bit block cipher birthday attack)",
+      "published": "2016-09-01",
+      "description": "DES and Triple DES ciphers used in TLS and SSH have a 64-bit block size, making them vulnerable to a birthday attack that can recover plaintext from a long-lived encrypted session.",
+      "cwe": "CWE-327 Use of a Broken or Risky Cryptographic Algorithm",
+      "cvss_v3": {
+        "score": 3.7,
+        "severity": "Low",
+        "vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N"
+      },
+      "affected": "Any TLS/SSH endpoint offering 3DES (DES-CBC3-SHA) cipher suites",
+      "exploit": {
+        "maturity": "none",
+        "kev": false,
+        "kev_date_added": null,
+        "ransomware_campaign_use": false,
+        "notes": "Academic. A practical attack needs roughly 785GB of captured traffic within a single keep-alive session. Reported constantly by scanners; almost never a real-world risk. Classic scanner-noise finding."
+      },
+      "remediation": {
+        "summary": "Remove 3DES cipher suites from the TLS configuration.",
+        "steps": [
+          "Remove DES/3DES suites from the cipher list (e.g. nginx: ssl_ciphers HIGH:!aNULL:!MD5:!3DES;).",
+          "Confirm no legacy client requires 3DES before removing it.",
+          "Reload the service.",
+          "Bundle this with the next routine TLS hardening change - it does not warrant its own change ticket."
+        ],
+        "type": "config",
+        "effort": "low",
+        "requires_reboot": false,
+        "requires_downtime": false,
+        "change_risk": "low"
+      }
+    }
+  }
+}

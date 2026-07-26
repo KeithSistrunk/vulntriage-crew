@@ -1,0 +1,13 @@
+Plugin ID,CVE,CVSS v3.0 Base Score,Risk,Host,Protocol,Port,Name,Solution,Plugin Output,State
+155999,CVE-2021-44228,10.0,Critical,prod-db-01.corp.example.net,tcp,8080,Apache Log4j 2.x < 2.15.0 Remote Code Execution (Log4Shell),Upgrade to Log4j 2.17.1 or later.,Installed version : 2.14.1,open
+157201,CVE-2021-4034,7.8,High,10.20.4.11,tcp,0,polkit pkexec Local Privilege Escalation (PwnKit),Update the polkit package.,polkit-0.115-13.el8,open
+140770,CVE-2020-1472,10.0,Critical,DC-01.CORP.EXAMPLE.NET,tcp,445,Netlogon Elevation of Privilege (Zerologon),Apply the August 2020 cumulative update.,Zeroed client challenge accepted.,open
+97833,CVE-2017-0144,8.1,Critical,dc-01,tcp,445,MS17-010: Security Update for Microsoft Windows SMB Server (EternalBlue),Apply MS17-010 and disable SMBv1.,SMBv1 enabled.,open
+112142,,5.3,Medium,edge-web-01.corp.example.net,tcp,22,OpenSSH < 7.8 User Enumeration (CVE-2018-15473),Upgrade to OpenSSH 7.8 or later.,SSH-2.0-OpenSSH_7.6p1,open
+159374,CVE-2022-22965,9.8,Critical,edge-web-01.corp.example.net,tcp,8443,Spring Framework Remote Code Execution (Spring4Shell),Upgrade Spring Framework to 5.3.18 or later.,Spring 5.3.15 on Tomcat 9.0.58 / JDK 17.,open
+181812,"CVE-2023-4863, CVE-2019-11043",9.8,Critical,hr-app-03.corp.example.net,tcp,80,CentOS 7 : multiple vulnerabilities in libwebp and php-fpm,Update libwebp and php-fpm.,libwebp-1.0.3-1.el7 / php-fpm-7.2.20,open
+134862,CVE-2020-0796,10.0,Critical,branch-114-fs01.corp.example.net,tcp,445,Windows SMBv3 Compression Remote Code Execution (SMBGhost),Apply KB4551762.,SMBv3.1.1 compression enabled.,open
+151361,CVE-2021-34527,,High,POS-TERM-221,tcp,445,Windows Print Spooler Remote Code Execution (PrintNightmare),Apply the July 2021 update and disable the spooler where possible.,Spooler running; driver install unrestricted.,open
+182879,CVE-2023-38545,9.8,Critical,test-lab-07.corp.example.net,tcp,0,curl / libcurl < 8.4.0 SOCKS5 Heap Buffer Overflow,Update curl to 8.4.0 or later.,Installed version : 8.2.1,open
+19506,,,Info,prod-db-01.corp.example.net,tcp,0,Nessus Scan Information,n/a,Credentialed checks : yes,open
+156860,CVE-2021-44228,10.0,Critical,dev-build-02.corp.example.net,tcp,8080,Apache Log4j 2.x < 2.15.0 Remote Code Execution (Log4Shell),Upgrade to Log4j 2.17.1 or later.,Remediated 2026-06-01.,fixed
