@@ -178,12 +178,20 @@ class NvdClient:
         self.cache.set(cve, record.as_dict())
         return record
 
+    # Flush this often mid-fetch. A 651-CVE cold pull is about eight minutes of
+    # paced requests; saving only at the end means a Ctrl-C at minute seven
+    # throws all of it away and the next run starts from nothing.
+    CHECKPOINT_EVERY = 25
+
     def fetch_many(self, cve_ids: Any) -> dict[str, NvdRecord]:
         out: dict[str, NvdRecord] = {}
-        for cve in dict.fromkeys(c.strip().upper() for c in cve_ids if c and c.strip()):
+        wanted = list(dict.fromkeys(c.strip().upper() for c in cve_ids if c and c.strip()))
+        for index, cve in enumerate(wanted, start=1):
             record = self.fetch(cve)
             if record:
                 out[cve] = record
+            if index % self.CHECKPOINT_EVERY == 0:
+                self.cache.save()
         self.cache.save()
         return out
 

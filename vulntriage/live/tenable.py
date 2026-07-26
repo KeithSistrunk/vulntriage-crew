@@ -22,6 +22,7 @@ import logging
 import os
 from typing import Any
 
+from ..models import AssetContext
 from .http import LiveFetchError, get_json
 
 log = logging.getLogger("vulntriage.live")
@@ -60,6 +61,8 @@ class TenableClient:
         self.flavor = (flavor or os.getenv("TENABLE_FLAVOR") or "io").strip().lower()
         self._fetch = fetch
         self.error: str | None = None
+        self.plugins_seen = 0
+        self.plugins_without_cve = 0
 
     # -- auth ---------------------------------------------------------------
     @property
@@ -89,6 +92,56 @@ class TenableClient:
                 assets[str(asset_id)] = asset
         return assets
 
+    def fetch_asset_contexts(self) -> dict[str, AssetContext]:
+        """Build the host -> criticality index the risk model needs.
+
+        Without this the whole thesis of the project goes inert against live
+        data: the mock CMDB knows none of the real estate, so every finding
+        scores at the neutral asset weight and the ranking collapses back to
+        something close to a CVSS sort.
+
+        Tenable's Asset Criticality Rating is the "asset data / tags" the spec's
+        formula refers to. It is a 1-10 scale, banded here the way Tenable's own
+        documentation describes it.
+        """
+        try:
+            raw = self.fetch_assets()
+        except (LiveFetchError, TenableAuthError) as exc:
+            log.warning("Tenable asset workbench unavailable (%s); continuing", exc)
+            self.error = str(exc)
+            return {}
+
+        index: dict[str, AssetContext] = {}
+        for asset in raw.values():
+            hostname = _first(asset.get("hostname")) or _first(asset.get("netbios_name"))
+            fqdn = _first(asset.get("fqdn"))
+            ipv4 = _first(asset.get("ipv4"))
+            name = hostname or (fqdn.split(".")[0] if fqdn else None) or ipv4
+            if not name:
+                continue
+
+            acr = asset.get("acr_score")
+            context = AssetContext(
+                hostname=name,
+                fqdn=fqdn,
+                known_asset=True,
+                os=_first(asset.get("operating_system")),
+                criticality=acr_to_criticality(acr),
+                # Tenable's workbench does not say whether a host is reachable
+                # from the internet, so this stays False rather than guessing.
+                # Getting it wrong in either direction moves the score.
+                internet_facing=False,
+                notes=(
+                    f"Tenable asset (ACR {acr})" if acr is not None
+                    else "Tenable asset with no ACR - criticality assumed medium"
+                ),
+            )
+            for key in (hostname, fqdn, ipv4, name):
+                if key:
+                    index[str(key).strip().lower()] = context
+        log.info("Tenable: asset criticality for %d identities", len(index))
+        return index
+
     def fetch_vulnerabilities(self) -> list[dict[str, Any]]:
         """The vulnerability workbench, one row per plugin/asset pair."""
         payload = self._fetch(
@@ -99,94 +152,135 @@ class TenableClient:
         return list((payload or {}).get("vulnerabilities", []) or [])
 
     def fetch_vulnerability_outputs(self, plugin_id: Any) -> list[dict[str, Any]]:
-        """Per-plugin detail -- this is where host, port and state actually live."""
+        """Per-plugin detail -- this is where host, port and state actually live.
+
+        The endpoint returns `{"outputs": [...]}`, not a bare list. Treating the
+        payload as a list yields the dict's *keys* -- a list of strings -- which
+        fails later with a confusing "'str' object has no attribute 'get'".
+        """
         payload = self._fetch(
             f"{self.base_url}/workbenches/vulnerabilities/{plugin_id}/outputs",
             headers=self._headers(),
         )
+        if isinstance(payload, dict):
+            return list(payload.get("outputs") or [])
         return list(payload or [])
 
+    def fetch_vulnerability_info(self, plugin_id: Any) -> dict[str, Any]:
+        """Plugin metadata -- and the only place the CVE ids actually appear.
+
+        The vulnerability workbench summary carries plugin id, name, severity and
+        a CVSS score but *no* CVE reference at all, so this second call is not
+        optional: without it every finding would be dropped for having no CVE.
+        """
+        payload = self._fetch(
+            f"{self.base_url}/workbenches/vulnerabilities/{plugin_id}/info",
+            headers=self._headers(),
+        )
+        return dict((payload or {}).get("info") or {})
+
     # -- normalization ------------------------------------------------------
-    def fetch_findings(self) -> list[dict[str, Any]]:
+    def fetch_findings(self, progress=None) -> list[dict[str, Any]]:
         """Every open finding, as raw rows in the mock export's shape.
 
-        The workbench summary gives one row per plugin; the per-plugin outputs
-        give the hosts and ports it fired on. One finding is one host + one port
-        + one CVE, so the outputs are what actually get expanded.
+        Three calls per plugin would be wasteful, so the order matters: the
+        workbench summary lists the plugins, `/info` supplies the CVEs, and
+        `/outputs` supplies the hosts and ports. A plugin whose `/info` carries
+        no CVE is skipped before its outputs are ever requested -- the normalizer
+        drops CVE-less rows anyway, and on a real estate that is most of them.
         """
-        assets = self._safe_assets()
+        summary = self.fetch_vulnerabilities()
         rows: list[dict[str, Any]] = []
+        skipped_no_cve = 0
 
-        for vuln in self.fetch_vulnerabilities():
+        for index, vuln in enumerate(summary, start=1):
             plugin = vuln.get("plugin_id") or (vuln.get("plugin") or {}).get("id")
             if plugin is None:
                 continue
+            if progress:
+                progress(index, len(summary), vuln.get("plugin_name") or str(plugin))
+
+            try:
+                info = self.fetch_vulnerability_info(plugin)
+            except LiveFetchError as exc:
+                log.warning("Tenable: no info for plugin %s (%s)", plugin, exc)
+                continue
+
+            cves = _cves_from_info(info) or _cve_list(vuln)
+            if not cves:
+                skipped_no_cve += 1
+                continue
+
             try:
                 outputs = self.fetch_vulnerability_outputs(plugin)
             except LiveFetchError as exc:
                 # One noisy plugin must not cost the whole pull.
                 log.warning("Tenable: no outputs for plugin %s (%s)", plugin, exc)
                 continue
-            rows.extend(self._rows_for_plugin(vuln, plugin, outputs, assets))
 
-        log.info("Tenable: %d raw finding row(s)", len(rows))
+            rows.extend(self._rows_for_plugin(vuln, plugin, cves, info, outputs))
+
+        self.plugins_seen = len(summary)
+        self.plugins_without_cve = skipped_no_cve
+        log.info(
+            "Tenable: %d plugin(s), %d without a CVE, %d raw finding row(s)",
+            len(summary), skipped_no_cve, len(rows),
+        )
         return rows
-
-    def _safe_assets(self) -> dict[str, dict[str, Any]]:
-        try:
-            return self.fetch_assets()
-        except LiveFetchError as exc:
-            # Asset context is a bonus here; the CMDB join still happens in intel.py.
-            log.warning("Tenable asset workbench unavailable (%s); continuing", exc)
-            self.error = str(exc)
-            return {}
 
     def _rows_for_plugin(
         self,
         vuln: dict[str, Any],
         plugin_id: Any,
+        cves: list[str],
+        info: dict[str, Any],
         outputs: list[dict[str, Any]],
-        assets: dict[str, dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        plugin_name = vuln.get("plugin_name") or (vuln.get("plugin") or {}).get("name") or ""
-        severity = _severity_id(vuln.get("severity"))
-        cves = _cve_list(vuln)
+        plugin_name = (
+            vuln.get("plugin_name")
+            or ((info.get("plugin_details") or {}).get("name"))
+            or ""
+        )
+        severity = _severity_id(vuln.get("severity", info.get("severity")))
+        risk = info.get("risk_information") or {}
         cvss = _first_float(
+            risk.get("cvss3_base_score"),
             vuln.get("cvss3_base_score"),
+            risk.get("cvss_base_score"),
             vuln.get("cvss_base_score"),
-            (vuln.get("plugin") or {}).get("cvss3_base_score"),
         )
 
         rows: list[dict[str, Any]] = []
         for output in outputs:
+            evidence = output.get("plugin_output")
             for state_block in output.get("states") or []:
                 state = str(state_block.get("name") or "open").lower()
                 for result in state_block.get("results") or []:
-                    for host in result.get("hosts") or []:
+                    port = result.get("port")
+                    protocol = result.get("transport_protocol") or result.get("protocol")
+                    service = result.get("application_protocol") or result.get("service")
+                    # Real payloads key this `assets`; the docs say `hosts`.
+                    for asset in result.get("assets") or result.get("hosts") or []:
                         rows.append(
                             self._row(
-                                host=host,
-                                assets=assets,
+                                asset=asset,
                                 plugin_id=plugin_id,
                                 plugin_name=plugin_name,
                                 severity=severity,
                                 cves=cves,
                                 cvss=cvss,
-                                port=result.get("port"),
-                                protocol=result.get("protocol"),
-                                service=result.get("service"),
+                                port=port,
+                                protocol=protocol,
+                                service=service,
                                 state=state,
-                                evidence=output.get("plugin_output"),
-                                first_found=state_block.get("first_found") or result.get("first_found"),
-                                last_found=state_block.get("last_found") or result.get("last_found"),
+                                evidence=evidence,
                             )
                         )
         return rows
 
     @staticmethod
     def _row(
-        host: dict[str, Any],
-        assets: dict[str, dict[str, Any]],
+        asset: dict[str, Any],
         plugin_id: Any,
         plugin_name: str,
         severity: int,
@@ -197,23 +291,20 @@ class TenableClient:
         service: Any,
         state: str,
         evidence: Any,
-        first_found: Any,
-        last_found: Any,
     ) -> dict[str, Any]:
-        asset = assets.get(str(host.get("id") or ""), {})
         # `host` is the key the normalizer's `_split_host` actually reads, and it
         # prefers an FQDN there because that is what reconciles against the CMDB.
         # Emitting `hostname` instead silently drops every finding back to being
         # identified by IP.
         identity = (
             _first(asset.get("fqdn"))
-            or host.get("hostname")
+            or _first(asset.get("hostname"))
             or _first(asset.get("netbios_name"))
-            or host.get("ip")
             or _first(asset.get("ipv4"))
+            or _first(asset.get("ip"))
             or ""
         )
-        ip = host.get("ip") or _first(asset.get("ipv4"))
+        ip = _first(asset.get("ipv4")) or _first(asset.get("ip"))
 
         return {
             "host": identity,
@@ -228,8 +319,8 @@ class TenableClient:
             "severity_name": SEVERITY_NAMES.get(severity, "Info"),
             "cvss3_base_score": cvss,
             "state": state,
-            "first_found": first_found,
-            "last_found": last_found,
+            "first_found": asset.get("first_seen"),
+            "last_found": asset.get("last_seen"),
             "plugin_output": evidence,
         }
 
@@ -237,6 +328,26 @@ class TenableClient:
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+
+def acr_to_criticality(acr: Any) -> str:
+    """Tenable's 1-10 Asset Criticality Rating -> the model's criticality band.
+
+    Bands follow Tenable's own documentation. An asset with no ACR comes back
+    "unknown", which the risk model already treats as a neutral x1.00 rather
+    than inventing a criticality for it.
+    """
+    try:
+        score = float(acr)
+    except (TypeError, ValueError):
+        return "unknown"
+    if score >= 9:
+        return "critical"
+    if score >= 7:
+        return "high"
+    if score >= 4:
+        return "medium"
+    return "low"
+
 
 def _first(value: Any) -> Any:
     """Tenable returns several asset attributes as single-element lists."""
@@ -259,6 +370,23 @@ def _severity_id(value: Any) -> int:
     if isinstance(value, (int, float)):
         return int(value)
     return SEVERITY_IDS.get(str(value or "").strip().lower(), 0)
+
+
+def _cves_from_info(info: dict[str, Any]) -> list[str]:
+    """Pull CVE ids out of a plugin's reference block.
+
+    Shape is a list of named reference groups, only one of which is CVEs:
+        [{"name": "cve", "values": ["CVE-2025-53783"]}, {"name": "iava", ...}]
+    """
+    out: list[str] = []
+    for group in info.get("reference_information") or []:
+        if str(group.get("name") or "").strip().lower() != "cve":
+            continue
+        for value in group.get("values") or []:
+            text = str(value or "").strip().upper()
+            if text.startswith("CVE-"):
+                out.append(text)
+    return list(dict.fromkeys(out))
 
 
 def _cve_list(vuln: dict[str, Any]) -> list[str]:

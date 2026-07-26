@@ -117,7 +117,7 @@ def lookup_asset(host: str) -> AssetContext:
 # enrichment
 # --------------------------------------------------------------------------- #
 
-def enrich(finding: NormalizedFinding, live=None) -> EnrichedFinding:
+def enrich(finding: NormalizedFinding, live=None, assets=None) -> EnrichedFinding:
     """Attach CVE intel and asset context to a single normalized finding.
 
     `live` is an optional `vulntriage.live.LiveIntel`. When present, its feeds
@@ -129,6 +129,20 @@ def enrich(finding: NormalizedFinding, live=None) -> EnrichedFinding:
     asset = lookup_asset(finding.fqdn or finding.hostname)
     if not asset.known_asset and finding.ip:
         asset = lookup_asset(finding.ip)
+    if not asset.known_asset and assets:
+        # Fall back to the scanner's own asset record. The local CMDB wins when
+        # it has an entry -- it carries owner, compliance scope, maintenance
+        # window and internet exposure, none of which Tenable's workbench knows.
+        # But against a live estate the CMDB knows nothing, and without this the
+        # asset multiplier is a flat 1.00 for every finding, which quietly turns
+        # the risk model back into a CVSS sort.
+        for key in (finding.fqdn, finding.hostname, finding.ip):
+            if not key:
+                continue
+            found = assets.get(str(key).strip().lower())
+            if found:
+                asset = found.model_copy()
+                break
     if not asset.known_asset:
         asset.hostname = finding.hostname
 
@@ -162,7 +176,7 @@ def enrich(finding: NormalizedFinding, live=None) -> EnrichedFinding:
     )
 
 
-def enrich_all(findings: list[NormalizedFinding], live=None) -> list[EnrichedFinding]:
+def enrich_all(findings: list[NormalizedFinding], live=None, assets=None) -> list[EnrichedFinding]:
     """Enrich every finding, collapsing duplicates that only host reconciliation reveals.
 
     Discovery cannot tell that `10.20.4.11` and `prod-db-01` are the same box --
@@ -178,7 +192,7 @@ def enrich_all(findings: list[NormalizedFinding], live=None) -> list[EnrichedFin
 
     enriched: dict[str, EnrichedFinding] = {}
     for finding in findings:
-        result = enrich(finding, live=live)
+        result = enrich(finding, live=live, assets=assets)
         existing = enriched.get(result.finding_id)
         if existing:
             existing.source_rows += result.source_rows

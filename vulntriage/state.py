@@ -38,6 +38,8 @@ class PipelineState:
         self.finding_source: str = "mock"
         self.tenable_client: Any | None = None
         self.live: Any | None = None
+        # host identity -> AssetContext, from the scanner when the CMDB is blank
+        self.asset_index: dict[str, Any] = {}
         self.reset()
 
     def configure(
@@ -45,11 +47,13 @@ class PipelineState:
         finding_source: str = "mock",
         tenable_client: Any | None = None,
         live: Any | None = None,
+        asset_index: dict[str, Any] | None = None,
     ) -> None:
         """Point the pipeline at live sources. Called once, before discovery."""
         self.finding_source = finding_source
         self.tenable_client = tenable_client
         self.live = live
+        self.asset_index = asset_index or {}
 
     @property
     def live_warnings(self) -> list[str]:

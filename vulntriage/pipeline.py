@@ -58,7 +58,9 @@ def run_discovery_tenable(client, state: PipelineState = STATE) -> Normalization
 
 
 def run_enrichment(state: PipelineState = STATE, live=None) -> int:
-    state.enriched = enrich_all(state.require_normalized(), live=live or state.live)
+    state.enriched = enrich_all(
+        state.require_normalized(), live=live or state.live, assets=state.asset_index
+    )
     state.scored = []
     return len(state.enriched)
 

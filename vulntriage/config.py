@@ -11,11 +11,35 @@ import os
 from dataclasses import dataclass
 
 try:  # optional convenience, not a hard dependency
-    from dotenv import load_dotenv
+    from dotenv import dotenv_values, load_dotenv
 
+    # Standard precedence: a variable already exported in the shell beats .env,
+    # so `LLM_MODEL=x python main.py` still works for a one-off.
     load_dotenv()
+
+    def _warn_on_shadowed_secrets() -> list[str]:
+        """Say so when .env holds a different value than the shell is using.
+
+        This is worth a warning rather than silence: .env is the documented
+        place to put keys, so a stale exported variable shadowing it looks
+        exactly like "my new credentials are being rejected". It cost a
+        debugging cycle once already -- a live Tenable pull kept returning 401
+        against a key the user had already replaced in .env.
+        """
+        import os as _os
+
+        shadowed: list[str] = []
+        for name, file_value in (dotenv_values() or {}).items():
+            if not file_value:
+                continue
+            live_value = _os.environ.get(name)
+            if live_value is not None and live_value != file_value:
+                shadowed.append(name)
+        return shadowed
+
+    SHADOWED_BY_SHELL = _warn_on_shadowed_secrets()
 except ImportError:  # pragma: no cover
-    pass
+    SHADOWED_BY_SHELL = []
 
 DEFAULT_OLLAMA_MODEL = "llama3.1:8b"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"

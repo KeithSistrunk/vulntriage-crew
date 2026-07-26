@@ -342,38 +342,85 @@ def test_nvd_unknown_cve_and_outage_both_degrade():
 # 4. Tenable
 # --------------------------------------------------------------------------- #
 
+# These fixtures are the *observed* Tenable.io payloads, captured from a live
+# instance -- not the shapes the integration spec describes. They differ in four
+# ways that each broke the pull, and every one is load-bearing here:
+#
+#   - /outputs returns {"outputs": [...]}, not a bare list
+#   - results carry `assets`, not `hosts`, and the assets are inline (fqdn, ipv4)
+#   - the transport is `transport_protocol`; the service is `application_protocol`
+#   - the vulnerability workbench has NO cve field at all -- CVEs live only on
+#     /info, under reference_information
+#
+# A fixture matching the documentation instead of the API is worse than no test:
+# it passes while the integration is broken.
+
 TENABLE_VULNS = {
     "vulnerabilities": [
         {
             "plugin_id": 155999,
             "plugin_name": "Apache Log4j RCE (Log4Shell)",
+            "plugin_family": "Web Servers",
             "severity": 4,
-            "cve": ["CVE-2021-44228"],
-            "cvss3_base_score": 10.0,
-        }
+            "cvss_base_score": 9.3,
+            "count": 1,
+            "vulnerability_state": "Active",
+        },
+        {
+            "plugin_id": 10114,
+            "plugin_name": "ICMP Timestamp Request Remote Date Disclosure",
+            "severity": 1,
+            "count": 89,
+        },
     ]
 }
 
-TENABLE_OUTPUTS = [
-    {
-        "plugin_output": "Log4j 2.14.1 detected",
-        "states": [
-            {
-                "name": "open",
-                "results": [
-                    {
-                        "port": 8080,
-                        "protocol": "tcp",
-                        "service": "www",
-                        "hosts": [{"id": "asset-1", "hostname": "prod-db-01", "ip": "10.20.4.11"}],
-                        "first_found": "2026-07-01T00:00:00Z",
-                        "last_found": "2026-07-20T00:00:00Z",
-                    }
-                ],
-            }
-        ],
-    }
-]
+TENABLE_INFO = {
+    155999: {
+        "info": {
+            "severity": 4,
+            "plugin_details": {"name": "Apache Log4j RCE (Log4Shell)", "family": "Web Servers"},
+            "reference_information": [
+                {"name": "cve", "values": ["CVE-2021-44228"]},
+                {"name": "iava", "values": ["2021-A-0573"]},
+            ],
+            "risk_information": {"cvss3_base_score": "10.0", "cvss_base_score": "9.3"},
+        }
+    },
+    # A plugin with no CVE reference at all: must be skipped before its outputs
+    # are ever requested.
+    10114: {"info": {"severity": 1, "reference_information": [{"name": "xref", "values": ["x"]}]}},
+}
+
+TENABLE_OUTPUTS = {
+    "outputs": [
+        {
+            "plugin_output": "Log4j 2.14.1 detected",
+            "states": [
+                {
+                    "name": "active",
+                    "results": [
+                        {
+                            "application_protocol": "www",
+                            "port": 8080,
+                            "transport_protocol": "tcp",
+                            "assets": [
+                                {
+                                    "id": "8e8434bf-41d0-48ad-b2e6-05e71b38785f",
+                                    "hostname": "prod-db-01",
+                                    "fqdn": "prod-db-01.corp.example.net",
+                                    "ipv4": "10.20.4.11",
+                                    "first_seen": "2026-07-01T00:00:00Z",
+                                    "last_seen": "2026-07-20T00:00:00Z",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+}
 
 TENABLE_ASSETS = {
     "assets": [
@@ -381,11 +428,17 @@ TENABLE_ASSETS = {
     ]
 }
 
+_OUTPUTS_REQUESTED: list[str] = []
+
 
 def _tenable_fetch(url, headers=None, params=None, **kwargs):
     if "/workbenches/assets" in url:
         return TENABLE_ASSETS
+    if "/info" in url:
+        plugin = int(url.rstrip("/info").rsplit("/", 1)[-1])
+        return TENABLE_INFO.get(plugin, {"info": {}})
     if "/outputs" in url:
+        _OUTPUTS_REQUESTED.append(url)
         return TENABLE_OUTPUTS
     if "/workbenches/vulnerabilities" in url:
         return TENABLE_VULNS
@@ -426,24 +479,126 @@ def test_tenable_rows_normalize_into_the_discovery_shape():
 
     finding = findings[0]
     assert finding.cve == "CVE-2021-44228"
-    assert finding.hostname == "prod-db-01"
+    assert finding.hostname == "prod-db-01", "the FQDN must resolve to the short name"
+    assert finding.fqdn == "prod-db-01.corp.example.net"
     assert finding.ip == "10.20.4.11"
     assert finding.port == 8080
+    assert finding.protocol == "tcp", "transport_protocol, not protocol"
+    assert finding.service == "www", "application_protocol, not service"
     assert finding.scanner_severity == 4
-    assert finding.scanner_cvss == 10.0
+    assert finding.scanner_cvss == 10.0, "risk_information's v3 score beats the summary's v2"
     assert finding.finding_id == "prod-db-01:8080:CVE-2021-44228"
 
 
-def test_tenable_asset_workbench_outage_does_not_lose_the_findings():
+def test_tenable_reads_cves_from_the_info_endpoint():
+    """The vulnerability workbench carries no CVE field; /info is the only source."""
+    assert "cve" not in TENABLE_VULNS["vulnerabilities"][0], "fixture must match the real API"
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=_tenable_fetch)
+    rows = client.fetch_findings()
+    assert rows[0]["cve"] == ["CVE-2021-44228"]
+
+
+def test_tenable_skips_plugins_with_no_cve_before_fetching_outputs():
+    """Most plugins on a real estate have no CVE, and the normalizer drops them.
+
+    Requesting their outputs anyway is a wasted round trip per plugin -- 16 of
+    105 on the instance this was built against.
+    """
+    _OUTPUTS_REQUESTED.clear()
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=_tenable_fetch)
+    client.fetch_findings()
+    assert client.plugins_seen == 2
+    assert client.plugins_without_cve == 1
+    assert len(_OUTPUTS_REQUESTED) == 1, "the CVE-less plugin must not cost an outputs call"
+    assert "10114" not in "".join(_OUTPUTS_REQUESTED)
+
+
+def test_tenable_outputs_endpoint_returns_a_dict_not_a_list():
+    """`list(payload)` on this endpoint yields the dict's keys -- a list of
+    strings -- which fails later as "'str' object has no attribute 'get'"."""
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=_tenable_fetch)
+    outputs = client.fetch_vulnerability_outputs(155999)
+    assert isinstance(outputs, list)
+    assert outputs and isinstance(outputs[0], dict), "must unwrap the 'outputs' key"
+
+
+def test_acr_maps_to_the_models_criticality_bands():
+    from vulntriage.live.tenable import acr_to_criticality
+
+    assert acr_to_criticality(10) == "critical"
+    assert acr_to_criticality(9) == "critical"
+    assert acr_to_criticality(7) == "high"
+    assert acr_to_criticality(6) == "medium"
+    assert acr_to_criticality(4) == "medium"
+    assert acr_to_criticality(3) == "low"
+    assert acr_to_criticality(None) == "unknown", "no ACR must not invent a criticality"
+    assert acr_to_criticality("") == "unknown"
+
+
+def test_tenable_asset_contexts_are_indexed_by_every_identity():
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=_tenable_fetch)
+    index = client.fetch_asset_contexts()
+    ctx = index.get("prod-db-01.corp.example.net")
+    assert ctx is not None and ctx.known_asset is True
+    # The same asset must be reachable by short name and IP too, because the
+    # normalizer may have identified the host by any of them.
+    assert index.get("10.20.4.11") is ctx
+
+
+def test_scanner_asset_criticality_fills_the_gap_the_cmdb_leaves():
+    """The failure this exists to prevent: against a live estate the mock CMDB
+    knows nothing, so every finding scored at a flat 1.00 asset weight and the
+    whole queue collapsed into P3/P4."""
+    from vulntriage.intel import enrich_all
+    from vulntriage.live.tenable import acr_to_criticality
+    from vulntriage.models import AssetContext, NormalizedFinding
+
+    finding = NormalizedFinding(
+        finding_id="unknown-box:443:CVE-2021-44228",
+        hostname="unknown-box", ip="10.9.9.9", port=443, cve="CVE-2021-44228",
+        plugin_id="1", plugin_name="p", scanner_severity=4,
+        scanner_severity_name="Critical", scanner_cvss=10.0,
+    )
+
+    without = enrich_all([finding])[0]
+    assert without.asset.known_asset is False
+    assert without.asset.criticality == "unknown"
+
+    index = {"unknown-box": AssetContext(
+        hostname="unknown-box", known_asset=True,
+        criticality=acr_to_criticality(9), notes="Tenable asset (ACR 9)",
+    )}
+    with_assets = enrich_all([finding], assets=index)[0]
+    assert with_assets.asset.known_asset is True
+    assert with_assets.asset.criticality == "critical"
+
+
+def test_the_local_cmdb_still_beats_the_scanner():
+    """The CMDB carries owner, compliance scope and exposure; Tenable does not."""
+    from vulntriage.intel import enrich_all
+    from vulntriage.models import AssetContext, NormalizedFinding
+
+    finding = NormalizedFinding(
+        finding_id="prod-db-01:8080:CVE-2021-44228",
+        hostname="prod-db-01", port=8080, cve="CVE-2021-44228",
+        plugin_id="1", plugin_name="p", scanner_severity=4,
+        scanner_severity_name="Critical", scanner_cvss=10.0,
+    )
+    index = {"prod-db-01": AssetContext(hostname="prod-db-01", known_asset=True,
+                                        criticality="low", notes="Tenable")}
+    enriched = enrich_all([finding], assets=index)[0]
+    assert enriched.asset.criticality == "critical", "the CMDB entry must win"
+    assert enriched.asset.owner, "and it brings owner/scope the scanner lacks"
+
+
+def test_tenable_one_noisy_plugin_does_not_lose_the_pull():
     def fetch(url, headers=None, params=None, **kwargs):
-        if "/workbenches/assets" in url:
-            raise LiveFetchError("assets 500")
+        if "/outputs" in url:
+            raise LiveFetchError("outputs 500")
         return _tenable_fetch(url, headers, params)
 
     client = TenableClient(access_key="AK", secret_key="SK", fetch=fetch)
-    rows = client.fetch_findings()
-    assert len(rows) == 1, "findings survive the asset join failing"
-    assert "assets 500" in client.error
+    assert client.fetch_findings() == [], "a failed plugin is skipped, not fatal"
 
 
 # --------------------------------------------------------------------------- #

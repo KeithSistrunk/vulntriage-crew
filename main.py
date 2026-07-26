@@ -116,6 +116,21 @@ def configure_sources(args: argparse.Namespace) -> int:
     lie. Failing to *reach* a feed later is not: the clients degrade and the run
     continues with less context.
     """
+    # A stale exported variable silently beating .env looks identical to a
+    # rejected credential. Never let that be silent.
+    try:
+        from vulntriage.config import SHADOWED_BY_SHELL
+
+        if SHADOWED_BY_SHELL:
+            print(
+                f"WARNING: {', '.join(sorted(SHADOWED_BY_SHELL))} differ between .env and your\n"
+                f"  shell environment, and the shell wins. The value in .env is NOT being used.\n"
+                f"  Clear the exported variable, or export the value you actually want.",
+                file=sys.stderr,
+            )
+    except ImportError:
+        pass
+
     live = None
     if args.live_intel:
         from vulntriage.live import EpssClient, KevClient, LiveIntel, NvdClient
@@ -146,7 +161,24 @@ def configure_sources(args: argparse.Namespace) -> int:
             return 2
         print(f"Findings source: Tenable ({client.flavor}) at {client.base_url}")
 
-    STATE.configure(finding_source=args.source, tenable_client=client, live=live)
+    # Asset criticality from the scanner. Without it every live finding scores at
+    # the neutral asset weight, and the ranking collapses toward a CVSS sort --
+    # the exact thing this project exists to avoid.
+    asset_index: dict = {}
+    if client is not None:
+        asset_index = client.fetch_asset_contexts()
+        if asset_index:
+            print(f"Asset criticality: {len(asset_index)} identities from Tenable ACR")
+        else:
+            print(
+                "WARNING: no Tenable asset data — every finding will score at the neutral\n"
+                "  asset weight, which flattens the ranking toward raw CVSS.",
+                file=sys.stderr,
+            )
+
+    STATE.configure(
+        finding_source=args.source, tenable_client=client, live=live, asset_index=asset_index
+    )
     return 0
 
 

@@ -157,6 +157,34 @@ unkeyed and a few seconds with a key.
 The local database still wins on **remediation guidance** — no public feed knows
 that a POS terminal cannot reboot during trading hours.
 
+### What the Tenable API actually returns
+
+Worth writing down, because it differs from the documented shape in four ways
+that each silently broke the pull:
+
+- `/workbenches/vulnerabilities` carries **no CVE field**. CVEs live only on
+  `/workbenches/vulnerabilities/{id}/info`, under `reference_information`, so
+  the pull is two calls per plugin, not one.
+- `/outputs` returns `{"outputs": [...]}`, not a bare list. Treating it as a
+  list yields the dict's *keys* and fails later as `'str' object has no
+  attribute 'get'`.
+- Results carry `assets`, not `hosts`, and each asset has its `fqdn` and `ipv4`
+  inline — so the separate asset-workbench call is not needed.
+- The transport is `transport_protocol` and the service is
+  `application_protocol`.
+
+Plugins whose `/info` lists no CVE are skipped before their outputs are ever
+requested: the normalizer drops CVE-less rows anyway, and that was 16 of 105
+plugins on the instance this was built against.
+
+### A stale exported variable beats .env
+
+`python-dotenv` does not override a variable already exported in your shell, so
+`TENABLE_ACCESS_KEY` left over in your environment silently wins over the one in
+`.env` — which looks exactly like your new credentials being rejected. The run
+now warns when the two disagree. Clear the exported variable, or export the value
+you actually want.
+
 ### Caching
 
 `.cache/` (gitignored) holds the KEV catalogue, EPSS scores and NVD records. It
