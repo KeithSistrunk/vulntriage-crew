@@ -13,33 +13,6 @@ The point is not that it finds vulnerabilities. Tenable already did that. The
 point is that it answers the question a scanner cannot: *of these 18 findings,
 which three actually matter this week, and why?*
 
-```
-Raw findings (Tenable/Nessus JSON or CSV)
-        │
-        ▼
-┌────────────────────┐
-│ 1. Discovery       │  parses + normalizes scanner output
-│    Agent           │  dedupes, splits multi-CVE rows, drops noise
-└─────────┬──────────┘
-          ▼
-┌────────────────────┐
-│ 2. Enrichment      │  adds CVE description, CVSS, exploit availability,
-│    Agent           │  CISA KEV status, and asset context from the CMDB
-└─────────┬──────────┘
-          ▼
-┌────────────────────┐
-│ 3. Prioritization  │  scores by CVSS × asset value × exploitability × exposure
-│    Agent           │  ranks, bands into P1–P4, audits its own ordering
-└─────────┬──────────┘
-          ▼
-┌────────────────────┐
-│ 4. Remediation     │  proposes fixes, effort estimates, change batching,
-│    Agent           │  and the operational constraints that gate them
-└─────────┬──────────┘
-          ▼
-   Triage report (ranked, actionable, analyst-approved)
-```
-
 ---
 
 ## The thesis
