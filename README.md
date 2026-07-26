@@ -1,4 +1,8 @@
-# VulnTriage Crew
+<p align="center">
+  <img src="docs/vulntriage_diagram.png"
+       alt="VulnTriage Crew architecture: raw scanner findings flow through four agents - Discovery, Enrichment, Prioritization and Remediation - over a shared pipeline state, producing a ranked triage report"
+       width="900">
+</p>
 
 **A CrewAI multi-agent system that takes raw vulnerability scanner output and runs
 it through a triage-to-remediation workflow — discovery, enrichment,
@@ -70,15 +74,7 @@ That inversion is the whole product. Everything else is plumbing.
 
 ---
 
-## Quickstart
-
-```bash
-git clone <this repo> && cd vulntriage-crew
-python -m venv .venv && .venv/Scripts/activate    # Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### Run it without an LLM
+## Run it without an LLM
 
 The data pipeline is deterministic, so you can see the whole thing work before
 setting up a model:
@@ -87,7 +83,7 @@ setting up a model:
 python main.py --offline
 ```
 
-### Run the actual crew (local, free)
+## Run the actual crew (local, free)
 
 ```bash
 ollama serve
@@ -115,23 +111,7 @@ row is a single line, and it carries the score breakdown alongside the result �
 someone can sort by `risk_score`, filter `priority = P1`, and still see the
 `asset_weight` and `exploit_weight` that produced the number.
 
-### Options
-
-```
---input, -i        raw scanner export, .json or .csv   (default: data/sample_findings.json)
---output-dir, -o   where the report goes               (default: output/)
---top-n, -n        findings that get a full write-up   (default: 5)
---offline          deterministic pipeline, no LLM
---provider         ollama | openai
---model            e.g. llama3.1:8b, gpt-4o-mini
---verbose, -v      stream each agent's reasoning and tool calls
---strict-narrative exit 3 if the narrative guard flags a claim (for CI)
-```
-
-Try `python main.py --offline --input data/sample_findings.csv` to watch the
-normalizer eat a completely different input format.
-
-### Which model to use
+## Which model to use
 
 **8B parameters is the practical floor.** The agents have to call tools reliably
 and then write a few hundred words of analysis, and small models struggle with
@@ -139,7 +119,7 @@ the second part in particular.
 
 | Model | Observed on the sample findings |
 |---|---|
-| `llama3.1:8b` *(recommended)* | All four agents produce usable analysis. Prioritization correctly justifies all three rank inversions; remediation produces a real sequenced plan with batching and effort. Still hallucinates in places — see below |
+| `llama3.1:8b` *(recommended)* | All four agents produce usable analysis. Prioritization correctly justifies all three rank inversions; remediation produces a real sequenced plan with batching and effort. Still hallucinates in places — see the narrative guard below |
 | `qwen2.5:7b`, `mistral:7b` | Not tested here; expect roughly 8B-class behaviour |
 | `llama3.2:3b` | Calls tools correctly — the **data is still right** — but the narrative fails: it pastes tool output back verbatim, the enrichment agent refused outright, and remediation emitted a raw tool-call blob instead of an answer |
 | `gpt-4o-mini` | Not tested here; costs money, best narrative quality |
@@ -150,55 +130,16 @@ in the next), attribute a Spring4Shell finding to the wrong host, and justify th
 Zerologon fix with Heartbleed's reasoning ("the keys are already gone") — the
 conclusion happened to be right, the reasoning was borrowed from another CVE.
 
-### What fixed it, and what it cost
+The 3B behaviour is worth understanding, because it is the reason the pipeline is
+built the way it is: **the report's data was correct in every run regardless of
+how badly the model narrated it.** When an agent returns a refusal or a malformed
+tool call, the report says so in that agent's section instead of publishing the
+artifact — see `usable_note()` in `vulntriage/report.py`. Numbers never depend on
+the model.
 
-Two things, both grounding rather than exhortation:
+## The narrative guard
 
-- **The tool states the closed set.** `get_ranked_findings` now opens with a
-  roster of valid CVE→host pairings, repeats each finding's host in its own
-  block, precomputes the effort total, and names the findings (if any) where a
-  patch is not the whole fix. The agent quotes rather than derives.
-- **The task names the failure modes.** Four rules in `vulntriage/tasks.py`:
-  never pair a CVE with another host, never carry reasoning between CVEs,
-  schedule each finding exactly once, take every fact from the tool.
-
-- **The guard checks the result.** `vulntriage/guard.py` re-derives those same
-  facts from `PipelineState` and flags any sentence that contradicts them. It
-  runs on every stage's narrative on every run — grounding you can verify beats
-  grounding you hope for.
-
-One trap worth naming, because the first version of this walked into it. The
-guardrails started out *inside* the tool output: the roster announced itself as
-"a closed set — any other pairing is wrong", each finding carried "(do not
-attribute CVE-2020-1472 to any other host)", the effort block said "quote these,
-do not re-derive". The agent quoted all of it into the report. Told to work from
-the tool's output, it could not tell the facts from the instructions about them —
-they were the same text.
-
-So the tool now returns **data only**, and every directive lives in the task
-prompt, where echoing it is not a way of answering. Facts in the tool, behaviour
-in the prompt. Guard check E7 enforces the split by flagging any narrative that
-reproduces the tool's headings or field labels.
-
-That eliminated the fabrication — verified mechanically across runs. **But the
-narrative shrank from 434 words of real analysis to 104 words of transcription.**
-The agent stopped attributing findings to wrong hosts partly by not naming hosts
-at all. On an 8B model the two failure modes trade against each other: grounded
-and thin, or rich and partly invented.
-
-Which is why the report is built the way it is. Tables, scores, remediation steps
-and effort totals are generated deterministically; the prose is quarantined in
-its own labelled section and is never load-bearing. A hallucinated sentence there
-is visible and correctable. A hallucinated CVSS score would not be.
-
-Treat the narrative as an analyst's first draft. If you want it to be genuinely
-useful rather than merely safe, that is the argument for `gpt-4o-mini` or a
-larger local model — not for loosening the constraints. See FUTURE_ADDONS.md
-item 5.
-
-### The narrative guard
-
-Six checks, each one a failure actually observed on an 8B run, each one decidable
+Seven checks, each one a failure actually observed on an 8B run, each one decidable
 against `PipelineState`:
 
 | | Check | Catches |
@@ -225,48 +166,6 @@ narratives, wrong host and borrowed reasoning and contradictory schedule — and
 asserts every one is caught.
 
     python -m vulntriage.guard output/pipeline_state.json   # check a saved run
-
-### Unattended runs
-
-A local 8B run takes long enough that you do not want to sit and watch it, so
-`scripts/lab_run.ps1` wraps `main.py` with everything an unattended run needs:
-
-```powershell
-.\scripts\lab_run.ps1                       # sample findings, default model
-.\scripts\lab_run.ps1 -Strict               # non-zero exit if the guard flags a claim
-.\scripts\lab_run.ps1 -Model llama3.1:8b -TopN 8 -OutputDir output-lab
-.\scripts\lab_run.ps1 -FallbackOffline      # degrade to --offline if Ollama will not start
-```
-
-It pins the interpreter to `.venv\Scripts\python.exe`, restarts Ollama if it has
-died and waits until it answers, forces `OLLAMA_IGPU_ENABLE=1` so inference does
-not silently land on the CPU, disables CrewAI tracing and telemetry, feeds the
-process an empty stdin so nothing can block on a prompt, and writes a timestamped
-log to `logs/`. File locks are already handled inside `main.py` — every output,
-including `pipeline_state.json`, is written beside a locked file rather than lost.
-
-Two deliberate choices. It **fails rather than silently degrading**: if Ollama
-cannot be revived it exits 4 instead of quietly producing a report with no
-narrative, because that is indistinguishable from a successful run at a glance.
-And it pins the interpreter because the test suite passes under the system python
-(pydantic is installed globally) while `crewai` exists only in the venv — a green
-suite is no guarantee the crew will start.
-
-| Exit | Meaning |
-|---:|---|
-| 0 | ran, guard clean |
-| 1 | findings file not found |
-| 2 | LLM backend unavailable |
-| 3 | ran, guard flagged a claim (`-Strict`) |
-| 4 | Ollama could not be revived |
-| 5 | venv interpreter missing |
-
-The 3B behaviour is worth understanding, because it is the reason the pipeline is
-built the way it is: **the report's data was correct in every run regardless of
-how badly the model narrated it.** When an agent returns a refusal or a malformed
-tool call, the report says so in that agent's section instead of publishing the
-artifact — see `usable_note()` in `vulntriage/report.py`. Numbers never depend on
-the model.
 
 ---
 
@@ -402,6 +301,13 @@ main.py                        entry point — load, run, report
 requirements.txt
 README.md
 FUTURE_ADDONS.md               the roadmap
+PRODUCTION_GUARDRAILS.md       what production would require
+
+docs/
+  vulntriage_diagram.png       the architecture diagram above
+
+scripts/
+  lab_run.ps1                  unattended run wrapper (revives Ollama, logs)
 
 vulntriage/
   agents.py                    the four agent definitions
@@ -415,6 +321,7 @@ vulntriage/
   scoring.py                   Prioritization: the risk model
   remediation.py               Remediation: fixes, effort, constraints
   report.py                    markdown + JSON + CSV report builders
+  guard.py                     narrative guard — the seven grounding checks
   pipeline.py                  deterministic pipeline (the --offline path)
   tools/
     findings_loader.py         Discovery agent's tool
@@ -431,6 +338,7 @@ data/
 
 tests/
   test_pipeline.py             risk model + normalization tests
+  test_guard.py                the guard's known-bad baseline
 ```
 
 ---
