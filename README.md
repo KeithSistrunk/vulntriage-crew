@@ -13,6 +13,11 @@ The point is not that it finds vulnerabilities. Tenable already did that. The
 point is that it answers the question a scanner cannot: *of these 18 findings,
 which three actually matter this week, and why?*
 
+> **Related:** [Vulnerability-Management-Program](https://github.com/KeithSistrunk/Vulnerability-Management-Program)
+> — the documented, manual vulnerability-management pipeline this project
+> automates. That repo is the process: intake, triage criteria, risk acceptance,
+> SLAs. This one is the same judgment expressed as code.
+
 ---
 
 ## The thesis
@@ -110,6 +115,28 @@ tool call, the report says so in that agent's section instead of publishing the
 artifact — see `usable_note()` in `vulntriage/report.py`. Numbers never depend on
 the model.
 
+## Output
+
+Every run writes four artifacts to `output/`:
+
+| File | For |
+|---|---|
+| `triage_report.md` | reading — tables, remediation plan, and the agents' narrative, guard-checked |
+| `triage_report.json` | machines — the full state, including the risk breakdown per finding |
+| `triage_report.csv` | spreadsheets and ticket imports — one row per finding |
+| `triage_report.pdf` | forwarding — every finding with CVE, CVSS, host, priority and remediation |
+
+**The PDF contains no agent narrative at all.** It is rendered from the same
+deterministic state as the CSV — scanner output, CVE intelligence, asset
+inventory — and never from `agent_notes`. A PDF is the artifact that travels
+furthest from the run that produced it, so it carries only what the pipeline can
+show its working for. Narrative belongs in the markdown report, where it is
+attributed to a named agent and flagged inline wherever the guard caught it.
+
+It is written directly, with no PDF library (`vulntriage/pdfwriter.py`), for the
+same reason `--offline` needs nothing but pydantic: a report that only appears
+after a `pip install` is not a report the run produces.
+
 ## Running against live data
 
 The POC ships with mock findings and a hand-curated CVE database. Both can be
@@ -118,6 +145,8 @@ swapped for live feeds without touching the agents:
 ```bash
 python main.py --offline --live-intel          # real KEV + EPSS + NVD, mock findings
 python main.py --source tenable --live-intel   # everything live
+python main.py --source tenable --limit 50     # widen the 20-CVE sample
+python main.py --source tenable --min-cvss 4   # lower the floor if too little survives
 python main.py --offline                       # unchanged: pure mock, no network
 ```
 
@@ -125,8 +154,37 @@ python main.py --offline                       # unchanged: pure mock, no networ
 |---|---|
 | `--source mock` *(default)* | findings from `data/sample_findings.json` |
 | `--source tenable` | findings pulled from the Tenable API |
+| `--limit N` *(default 20)* | sample a live pull down to N distinct CVEs; `0` lifts the cap |
+| `--min-cvss X` *(default 7.0)* | drop live findings below CVSS X before the cap; `0` lifts the floor |
 | `--live-intel` | enrich against CISA KEV, FIRST EPSS and NVD instead of `cve_db.json` |
 | `--no-cache` | bypass the on-disk intel cache and re-fetch |
+
+### The live pull is sampled, not truncated
+
+The estate this was built against has 105 workbench plugins behind thousands of
+findings, and enrichment spends a rate-limited NVD call on every distinct CVE —
+unkeyed, that is 30 seconds a page. So a live pull is capped at 20 by default.
+
+**What the cap keeps matters as much as the cap.** Tenable returns the workbench
+in plugin order, and taking the first 20 rows off it returned 20 hosts carrying
+one CVE-1999-0524 ICMP timestamp disclosure: 1 of 105 plugins, every finding P4,
+nothing to triage. A capped pull is therefore sampled:
+
+1. drop anything below `--min-cvss` (default 7.0, the CVSS v3 High boundary)
+2. keep each CVE once, at the highest-severity plugin reporting it
+3. walk the workbench in severity order
+4. stop at `--limit`
+
+which returns up to 20 *distinct* high-severity CVEs instead of 20 copies of the
+noisiest one. All four steps run inside the pull, so plugins beyond the cap are
+never requested and never enriched.
+
+Two things this deliberately trades away, both stated in the run summary and in
+the report's anomalies rather than hidden: only one affected host is shown per
+CVE (the rest are counted, not listed), and the sample is the severe end of the
+estate, not a survey of it. `--limit 0` lifts both the cap and the one-host-per-CVE
+dedupe for a real run; `--min-cvss` is its own filter and applies either way.
+`--source mock` ignores both flags entirely.
 
 ### Keys
 
