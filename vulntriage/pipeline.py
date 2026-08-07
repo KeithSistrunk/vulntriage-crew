@@ -20,6 +20,12 @@ from .scoring import score_all
 from .state import STATE, PipelineState
 
 
+# Sources that arrive through a client rather than by reading `path`. The Tenable
+# API and a Tenable CSV export both land here: the export is parsed by a client
+# that subclasses the API one, so both are sampled by the same code.
+CLIENT_SOURCES = {"tenable", "csv"}
+
+
 def run_discovery(path: str | Path, state: PipelineState = STATE) -> NormalizationReport:
     """Discovery from whichever source the state is configured for.
 
@@ -27,7 +33,7 @@ def run_discovery(path: str | Path, state: PipelineState = STATE) -> Normalizati
     findings actually come from -- `--source tenable` is a run-level decision,
     not something to re-explain to a language model.
     """
-    if state.finding_source == "tenable" and state.tenable_client is not None:
+    if state.finding_source in CLIENT_SOURCES and state.tenable_client is not None:
         return run_discovery_tenable(state.tenable_client, state)
 
     findings, report = normalize_file(path)
@@ -41,7 +47,7 @@ def run_discovery(path: str | Path, state: PipelineState = STATE) -> Normalizati
 
 
 def run_discovery_tenable(client, state: PipelineState = STATE) -> NormalizationReport:
-    """Discovery against a live Tenable pull.
+    """Discovery against a Tenable pull -- the API, one scan, or a CSV export.
 
     The client hands back raw rows in the same shape the mock export uses, so the
     normalizer -- and every quirk it already handles -- runs unchanged. That is
@@ -55,7 +61,11 @@ def run_discovery_tenable(client, state: PipelineState = STATE) -> Normalization
     estate, and a report that does not say so reads as a clean bill of health.
     """
     rows = client.fetch_findings()
-    findings, report = normalize(rows, source_file=f"tenable:{client.flavor}", source_format="api")
+    findings, report = normalize(
+        rows,
+        source_file=getattr(client, "source_label", f"tenable:{client.flavor}"),
+        source_format=getattr(client, "source_format", "api"),
+    )
     findings = _apply_limit(findings, getattr(client, "limit", None), report)
     _note_sampling(client, report)
     state.source_file = report.source_file
@@ -94,12 +104,22 @@ def _note_sampling(client, report: NormalizationReport) -> None:
     if not limit:
         return
 
+    # "workbench", "scan 58373", "export Keith-Scan.csv" -- whatever the client
+    # says it walked, so a new source describes itself instead of being guessed at.
+    pool = getattr(client, "pool", "workbench")
+    scope = "of the estate" if pool == "workbench" else f"of {pool}"
     report.anomalies.append(
         f"Sampled pull: up to {limit} distinct CVE(s) at CVSS >= "
         f"{getattr(client, 'min_cvss', 0)}, most severe first, one host per CVE. "
         f"{getattr(client, 'plugins_examined', 0)} of {getattr(client, 'plugins_seen', 0)} "
-        "workbench plugin(s) were examined. This is a sample of the estate, not a survey."
+        f"{pool} plugin(s) were examined. This is a sample {scope}, not a survey."
     )
+    recovered = getattr(client, "cves_recovered_from_name", 0)
+    if recovered:
+        report.anomalies.append(
+            f"{recovered} CVE id(s) were recovered from the plugin name because the source "
+            "carried no CVE reference for them. Treat the identifier as inferred, not asserted."
+        )
     crowded_out = getattr(client, "hosts_not_sampled", 0)
     if crowded_out:
         report.anomalies.append(

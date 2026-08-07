@@ -35,6 +35,14 @@ class NormalizedFinding(BaseModel):
     first_found: Optional[str] = None
     last_found: Optional[str] = None
     evidence: Optional[str] = None
+    solution: Optional[str] = Field(
+        None,
+        description=(
+            "The scanner's own remediation text, when the export carries one. "
+            "Vendor guidance as reported, not vetted advice - the intel database "
+            "wins wherever it has an entry."
+        ),
+    )
     source_rows: int = Field(1, description="How many raw rows collapsed into this finding")
 
 

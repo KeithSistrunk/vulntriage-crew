@@ -89,6 +89,7 @@ def _csv_row_to_dict(row: dict[str, str]) -> dict[str, Any]:
         "cvss3_base_score": get("CVSS v3.0 Base Score", "CVSS v3 Base Score", "CVSS"),
         "state": get("State") or "open",
         "plugin_output": get("Plugin Output", "Description", "Synopsis"),
+        "solution": get("Solution"),
     }
 
 
@@ -230,6 +231,11 @@ def normalize(
                 first = str(row.get("first_found") or "")
                 if first and (not existing.first_found or first < existing.first_found):
                     existing.first_found = first
+                # One of two duplicate plugins often carries the fix text and the
+                # other does not; losing it to whichever row happened to be read
+                # first would drop guidance the export actually supplied.
+                if not existing.solution:
+                    existing.solution = str(row.get("solution") or "").strip() or None
                 continue
 
             by_id[finding_id] = NormalizedFinding(
@@ -251,6 +257,7 @@ def normalize(
                 first_found=str(row.get("first_found") or "") or None,
                 last_found=str(row.get("last_found") or "") or None,
                 evidence=str(row.get("plugin_output") or "").strip() or None,
+                solution=str(row.get("solution") or "").strip() or None,
             )
 
     findings = sorted(by_id.values(), key=lambda f: (f.hostname, f.port or 0, f.cve))

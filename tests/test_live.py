@@ -904,6 +904,383 @@ def test_the_mock_path_ignores_the_sampling_entirely():
     assert any(f.cve == "CVE-2016-2183" for f in low), "the scanner-noise finding included"
 
 
+# -- scan results (--scan-id) -----------------------------------------------
+#
+# A scan is one run against one target list; the workbench is the estate's
+# current state. The scan endpoints return the same facts in different shapes,
+# and those shapes are the whole risk here:
+#
+#   - CVEs live under ref_information -> ref -> values -> value, not
+#     reference_information -> values
+#   - ports are the dict KEY "443 / tcp / www", not three fields
+#   - the host list's `hostname` is frequently the IP, and the FQDN is only in
+#     the host detail's info block
+#
+# Each of those, parsed wrongly, produces a pull that succeeds and is wrong.
+
+SCAN_ID = 58373
+
+SCAN_SUMMARY = {
+    "info": {"name": "Weekly DMZ scan", "scan_start": 1785000000},
+    "hosts": [
+        {"host_id": 7, "hostname": "10.20.4.11", "severitycount": {}},
+        {"host_id": 9, "hostname": "10.20.4.12"},
+    ],
+    "vulnerabilities": [
+        {
+            "plugin_id": 155999,
+            "plugin_name": "Apache Log4j RCE (Log4Shell)",
+            "severity": 4,
+            "count": 12,
+            "vuln_index": 0,
+        },
+        {"plugin_id": 10114, "plugin_name": "ICMP Timestamp", "severity": 1, "count": 40},
+    ],
+}
+
+SCAN_HOSTS = {
+    7: {
+        "info": {
+            "host-ip": "10.20.4.11",
+            "host-fqdn": "prod-db-01.corp.example.net",
+            "netbios-name": "PROD-DB-01",
+            "operating-system": ["Linux"],
+        },
+        "vulnerabilities": [
+            {"plugin_id": 155999, "plugin_name": "Apache Log4j RCE", "severity": 4, "count": 1},
+        ],
+    },
+    9: {
+        "info": {"host-ip": "10.20.4.12"},
+        "vulnerabilities": [
+            {"plugin_id": 10114, "plugin_name": "ICMP Timestamp", "severity": 1, "count": 1},
+        ],
+    },
+}
+
+SCAN_PLUGIN = {
+    "info": {
+        "plugindescription": {
+            "severity": 4,
+            "pluginname": "Apache Log4j RCE (Log4Shell)",
+            "pluginfamily": "Web Servers",
+            "pluginattributes": {
+                "risk_information": {"cvss3_base_score": "10.0", "cvss_base_score": "9.3"},
+                "ref_information": {
+                    "ref": [
+                        {"name": "cve", "values": {"value": ["CVE-2021-44228"]}},
+                        {"name": "iava", "values": {"value": ["2021-A-0573"]}},
+                    ]
+                },
+            },
+        }
+    },
+    "outputs": [
+        {
+            "plugin_output": "Log4j 2.14.1 detected",
+            "severity": 4,
+            "ports": {"8080 / tcp / www": [{"hostname": "10.20.4.11"}]},
+        }
+    ],
+}
+
+# The noisy low-severity plugin, with a real CVE and a CVSS below the floor --
+# the shape that made the estate-wide pull worthless before the sampling landed.
+SCAN_PLUGIN_LOW = {
+    "info": {
+        "plugindescription": {
+            "severity": 1,
+            "pluginname": "ICMP Timestamp Request Remote Date Disclosure",
+            "pluginattributes": {
+                "risk_information": {"cvss_base_score": "2.1"},
+                "ref_information": {
+                    "ref": [{"name": "cve", "values": {"value": ["CVE-1999-0524"]}}]
+                },
+            },
+        }
+    },
+    "outputs": [
+        {
+            "plugin_output": "timestamp disclosed",
+            "severity": 1,
+            "ports": {"0 / icmp / ": [{"hostname": "10.20.4.12"}]},
+        }
+    ],
+}
+
+SCAN_PLUGINS = {155999: SCAN_PLUGIN, 10114: SCAN_PLUGIN_LOW}
+
+
+def _scan_fetch(url, headers=None, params=None, **kwargs):
+    if "/workbenches/assets" in url:
+        return TENABLE_ASSETS
+    if "/plugins/" in url:
+        return SCAN_PLUGINS[int(url.rsplit("/", 1)[-1])]
+    if "/hosts/" in url:
+        return SCAN_HOSTS[int(url.rsplit("/", 1)[-1])]
+    if url.endswith(f"/scans/{SCAN_ID}"):
+        return SCAN_SUMMARY
+    if "/workbenches/" in url:
+        raise AssertionError("scan mode must not touch the workbench findings endpoints")
+    raise AssertionError(f"unexpected URL {url}")
+
+
+def _scan_client(**kwargs):
+    return TenableClient(
+        access_key="AK", secret_key="SK", scan_id=SCAN_ID, fetch=_scan_fetch, **kwargs
+    )
+
+
+def test_scan_mode_pulls_from_the_scan_results_api():
+    seen: list[str] = []
+
+    def fetch(url, headers=None, params=None, **kwargs):
+        seen.append(url)
+        return _scan_fetch(url, headers, params)
+
+    client = TenableClient(access_key="AK", secret_key="SK", scan_id=SCAN_ID, fetch=fetch)
+    rows = client.fetch_findings()
+
+    assert any(u.endswith(f"/scans/{SCAN_ID}") for u in seen), "must read /scans/{id}"
+    assert not [u for u in seen if "/workbenches/vulnerabilities" in u], \
+        "the workbench findings endpoints must not be used in scan mode"
+    assert len(rows) == 1
+
+
+def test_scan_rows_normalize_into_the_same_discovery_shape():
+    """The contract: a scan row is indistinguishable from a workbench row."""
+    rows = _scan_client().fetch_findings()
+    findings, report = normalize(rows, source_file="tenable:io", source_format="api")
+    assert len(findings) == 1
+
+    finding = findings[0]
+    assert finding.cve == "CVE-2021-44228", "CVEs come from ref_information -> ref"
+    assert finding.hostname == "prod-db-01", "the host detail's FQDN, not the list's IP"
+    assert finding.fqdn == "prod-db-01.corp.example.net"
+    assert finding.ip == "10.20.4.11"
+    assert finding.port == 8080, "the port is parsed out of the '8080 / tcp / www' key"
+    assert finding.protocol == "tcp"
+    assert finding.service == "www"
+    assert finding.scanner_cvss == 10.0, "the v3 score from risk_information"
+    assert finding.scanner_severity == 4
+
+
+def test_a_scan_port_key_is_split_into_port_protocol_and_service():
+    from vulntriage.live.tenable import _split_port_key
+
+    assert _split_port_key("8080 / tcp / www") == (8080, "tcp", "www")
+    assert _split_port_key("443 / tcp / ") == (443, "tcp", None)
+    # Port 0 is passed through as 0, not reinterpreted: the normalizer's _to_port
+    # already owns the "0 means host-level" rule, and duplicating that judgment
+    # in the translator is how the two layers drift apart.
+    assert _split_port_key("0 / icmp / ") == (0, "icmp", None)
+    assert _split_port_key("nonsense") == (None, None, None)
+
+
+def test_the_sampling_applies_to_a_scan_pull_too():
+    """min-cvss, the dedupe and the cap are source-agnostic."""
+    client = _scan_client()
+    rows = client.fetch_findings()
+
+    # The severity-1 ICMP plugin is below the 7.0 floor and never fetched.
+    assert client.plugins_below_min_cvss == 1
+    assert len(rows) == 1
+    assert client.min_cvss == 7.0 and client.limit == 20
+
+    tightened = _scan_client(min_cvss=0, limit=1)
+    assert len(tightened.fetch_findings()) == 1, "the cap still bites in scan mode"
+
+
+def test_a_scan_pull_reports_the_hosts_it_did_not_sample():
+    """The scan summary's `count` is the affected-host figure, not the one row
+    in hand -- scan mode reads a single host's output by design."""
+    client = _scan_client()
+    client.fetch_findings()
+    assert client.hosts_not_sampled == 11, "12 affected hosts, 1 sampled"
+
+
+def test_scan_host_identity_prefers_the_fqdn_over_the_ip_shaped_hostname():
+    from vulntriage.live.tenable import _scan_asset
+
+    asset = _scan_asset(SCAN_SUMMARY["hosts"][0], SCAN_HOSTS[7])
+    assert asset["fqdn"] == "prod-db-01.corp.example.net"
+    assert asset["ipv4"] == "10.20.4.11"
+    # A host with no FQDN keeps its address rather than inventing a name.
+    bare = _scan_asset(SCAN_SUMMARY["hosts"][1], SCAN_HOSTS[9])
+    assert bare["fqdn"] is None and bare["ipv4"] == "10.20.4.12"
+
+
+def test_scan_mode_consults_each_host_once_and_caches_it():
+    calls: list[str] = []
+
+    def fetch(url, headers=None, params=None, **kwargs):
+        calls.append(url)
+        return _scan_fetch(url, headers, params)
+
+    TenableClient(
+        access_key="AK", secret_key="SK", scan_id=SCAN_ID, min_cvss=0, fetch=fetch
+    ).fetch_findings()
+
+    summary_calls = [u for u in calls if u.endswith(f"/scans/{SCAN_ID}")]
+    host_calls = [u for u in calls if "/hosts/" in u and "/plugins/" not in u]
+    assert len(summary_calls) == 1, "the scan summary is fetched once"
+    assert len(host_calls) == len(set(host_calls)), "host details are cached, not refetched"
+
+
+def test_no_scan_id_keeps_the_workbench_as_the_default():
+    """The existing behaviour has to be exactly what it was."""
+    client = TenableClient(access_key="AK", secret_key="SK", fetch=_tenable_fetch)
+    assert client.scan_id is None
+    rows = client.fetch_findings()
+    assert len(rows) == 1 and rows[0]["cve"] == ["CVE-2021-44228"]
+    assert rows[0]["host"] == "prod-db-01.corp.example.net"
+
+
+def test_an_empty_scan_id_is_not_a_scan_id():
+    """`--scan-id ''` must not silently request /scans/ and 404."""
+    assert TenableClient(access_key="AK", secret_key="SK", scan_id="").scan_id is None
+    assert TenableClient(access_key="AK", secret_key="SK", scan_id=None).scan_id is None
+    assert TenableClient(access_key="AK", secret_key="SK", scan_id=58373).scan_id == "58373"
+
+
+def test_a_plugin_no_scan_host_reports_is_skipped_not_fatal():
+    """The summary and the per-host lists can disagree; that is not a crash."""
+    def fetch(url, headers=None, params=None, **kwargs):
+        if "/hosts/" in url and "/plugins/" not in url:
+            return {"info": {"host-ip": "10.0.0.1"}, "vulnerabilities": []}
+        return _scan_fetch(url, headers, params)
+
+    client = TenableClient(
+        access_key="AK", secret_key="SK", scan_id=SCAN_ID, min_cvss=0, fetch=fetch
+    )
+    assert client.fetch_findings() == []
+
+
+def test_a_scan_summary_with_no_cvss_is_floored_on_severity_before_the_detail_call():
+    """The fix for a pull that died against the real instance.
+
+    Scan 58373 is 153 plugins, 135 of them informational, and a scan summary
+    carries no CVSS at all -- so without a cheap floor every one of those cost a
+    rate-limited detail call and Tenable returned HTTP 429.
+    """
+    detail_calls: list[str] = []
+
+    def fetch(url, headers=None, params=None, **kwargs):
+        if "/plugins/" in url:
+            detail_calls.append(url)
+        return _scan_fetch(url, headers, params)
+
+    client = TenableClient(access_key="AK", secret_key="SK", scan_id=SCAN_ID, fetch=fetch)
+    client.fetch_findings()
+
+    assert len(detail_calls) == 1, "the severity-1 plugin must not cost a detail call"
+    assert client.plugins_examined == 1
+    assert client.plugins_below_min_cvss == 1
+
+
+def test_the_severity_prefilter_only_skips_bands_that_cannot_clear_the_floor():
+    client = _scan_client(min_cvss=7.0)
+    # Severity 2 tops out at 6.9, so nothing in it can reach 7.0.
+    assert client._below_floor_by_summary({"severity": 2}) is True
+    assert client._below_floor_by_summary({"severity": 3}) is False, "High can clear 7.0"
+    # A summary that carries its own score is judged on the score, not the band.
+    assert client._below_floor_by_summary({"severity": 1, "cvss3_base_score": "9.8"}) is False
+    # No floor, no prefilter.
+    assert _scan_client(min_cvss=0)._below_floor_by_summary({"severity": 0}) is False
+
+
+def test_the_prefilter_never_touches_the_workbench_path():
+    """`--scan-id` must not change what a workbench pull returns.
+
+    The prefilter trades a little accuracy (a v2-banded Medium whose v3 score is
+    High) for not being rate limited. The workbench has neither problem, so it
+    keeps judging on the authoritative score.
+    """
+    workbench = TenableClient(access_key="AK", secret_key="SK", fetch=_tenable_fetch)
+    assert workbench._below_floor_by_summary({"severity": 0}) is False
+    assert workbench._below_floor_by_summary({"severity": 2}) is False
+
+
+def test_a_cve_in_the_plugin_name_is_recovered_when_the_source_carries_none():
+    """Every plugin in the real scan returned `ref_information: null`.
+
+    The normalizer already recovers ids from plugin names, so a client that
+    skipped these would drop findings discovery would have kept -- silently.
+    """
+    nameless = {
+        "info": {
+            "plugindescription": {
+                "severity": 3,
+                "pluginname": "Windows PrintNightmare Registry Exposure CVE-2021-34527 RCE",
+                "pluginattributes": {
+                    "risk_information": {"cvss3_base_score": "8.8"},
+                    "ref_information": None,
+                },
+            }
+        },
+        "outputs": [
+            {"plugin_output": "exposed", "ports": {"445 / TCP / cifs": [{"hostname": "win"}]}}
+        ],
+    }
+
+    def fetch(url, headers=None, params=None, **kwargs):
+        if "/plugins/" in url:
+            return nameless
+        if "/hosts/" in url:
+            return {
+                "info": {"host-ip": "10.3.0.4"},
+                "vulnerabilities": [{"plugin_id": 151488, "severity": 3}],
+            }
+        if url.endswith(f"/scans/{SCAN_ID}"):
+            return {
+                "hosts": [{"host_id": 2, "hostname": "testwindowsscan"}],
+                "vulnerabilities": [
+                    {
+                        "plugin_id": 151488,
+                        "plugin_name": "Windows PrintNightmare Registry Exposure "
+                                       "CVE-2021-34527 RCE",
+                        "severity": 3,
+                        "count": 1,
+                    }
+                ],
+            }
+        raise AssertionError(url)
+
+    client = TenableClient(access_key="AK", secret_key="SK", scan_id=SCAN_ID, fetch=fetch)
+    rows = client.fetch_findings()
+
+    assert len(rows) == 1
+    assert rows[0]["cve"] == ["CVE-2021-34527"]
+    assert client.cves_recovered_from_name == 1, "an inferred id must be counted as inferred"
+    assert client.plugins_without_cve == 0
+
+
+def test_a_recovered_cve_is_declared_in_the_report():
+    """An inferred identifier must never read as one the scanner asserted."""
+    from vulntriage.pipeline import run_discovery_tenable
+    from vulntriage.state import PipelineState
+
+    class Recovering(TenableClient):
+        def fetch_findings(self, progress=None):
+            self.cves_recovered_from_name = 2
+            self.plugins_seen = 10
+            self.plugins_examined = 3
+            return [
+                {
+                    "host": "win-01", "ip": "10.0.0.1", "port": 445, "protocol": "tcp",
+                    "cve": ["CVE-2021-34527"], "plugin_id": "151488",
+                    "plugin_name": "PrintNightmare CVE-2021-34527", "severity": 3,
+                    "cvss3_base_score": 8.8, "state": "open",
+                }
+            ]
+
+    client = Recovering(access_key="AK", secret_key="SK", scan_id=SCAN_ID, fetch=_scan_fetch)
+    report = run_discovery_tenable(client, PipelineState())
+    assert any("recovered from the plugin name" in a for a in report.anomalies)
+    assert any(f"scan {SCAN_ID}" in a for a in report.anomalies), \
+        "the report must say which scan it sampled, not 'workbench'"
+
+
 def test_tenable_one_noisy_plugin_does_not_lose_the_pull():
     def fetch(url, headers=None, params=None, **kwargs):
         if "/outputs" in url:
@@ -1077,6 +1454,105 @@ def test_main_treats_source_failures_as_a_clean_exit_not_a_crash():
 
     assert LiveFetchError in entry.SOURCE_ERRORS
     assert TenableAuthError in entry.SOURCE_ERRORS
+
+
+# --------------------------------------------------------------------------- #
+# the interactive Tenable source menu
+#
+# The menu is the one place the CLI can block, so the tests that matter most are
+# the ones asserting it does *not* appear: an unattended run that meets a prompt
+# hangs until someone kills it.
+# --------------------------------------------------------------------------- #
+
+def _scope(argv: list[str], answers=(), tty: bool = True):
+    """Drive `choose_tenable_scope` over scripted answers.
+
+    Returns (exit code, resulting scan id, answers left unused) -- the last of
+    which is how a test proves nothing was asked at all.
+    """
+    import main as entry
+
+    args = entry.parse_args(argv)
+    replies = list(answers)
+
+    def ask(_prompt):
+        if not replies:
+            raise EOFError
+        reply = replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    original = entry.stdin_is_a_terminal
+    entry.stdin_is_a_terminal = lambda: tty
+    try:
+        code = entry.choose_tenable_scope(args, ask=ask)
+    finally:
+        entry.stdin_is_a_terminal = original
+    return code, args.scan_id, replies
+
+
+def test_the_menu_never_appears_without_a_terminal():
+    """The contract with scripts/lab_run.ps1, which redirects stdin from an
+    empty file: no terminal, no prompt, and the workbench as it always was."""
+    code, scan_id, unused = _scope(["--source", "tenable"], ["2", "58373"], tty=False)
+    assert (code, scan_id) == (0, None)
+    assert len(unused) == 2, "an unattended run must not be asked anything"
+
+
+def test_a_command_line_scan_id_skips_the_menu():
+    code, scan_id, unused = _scope(
+        ["--source", "tenable", "--scan-id", "58373"], ["1"]
+    )
+    assert (code, scan_id) == (0, "58373")
+    assert len(unused) == 1
+
+
+def test_the_mock_source_is_never_asked():
+    code, scan_id, unused = _scope([], ["2", "58373"])
+    assert (code, scan_id) == (0, None)
+    assert len(unused) == 2
+
+
+def test_option_one_keeps_the_workbench():
+    assert _scope(["--source", "tenable"], ["1"])[:2] == (0, None)
+
+
+def test_the_empty_answer_takes_the_workbench_default():
+    assert _scope(["--source", "tenable"], [""])[:2] == (0, None)
+
+
+def test_option_two_prompts_for_the_scan_id():
+    assert _scope(["--source", "tenable"], ["2", " 58373 "])[:2] == (0, "58373")
+
+
+def test_a_mistyped_choice_is_re_asked_not_fatal():
+    assert _scope(["--source", "tenable"], ["9", "2", "58373"])[:2] == (0, "58373")
+
+
+def test_giving_up_on_the_scan_id_falls_back_to_the_workbench():
+    """Blank is re-asked; running out of patience is not a crash."""
+    code, scan_id, _ = _scope(["--source", "tenable"], ["2", "", "", ""])
+    assert (code, scan_id) == (0, None)
+
+
+def test_stdin_ending_mid_menu_takes_the_default():
+    assert _scope(["--source", "tenable"], [])[:2] == (0, None)
+
+
+def test_ctrl_c_at_the_menu_cancels_the_run():
+    """Not the same as choosing the default -- an interrupt means stop."""
+    code, scan_id, _ = _scope(["--source", "tenable"], [KeyboardInterrupt()])
+    assert (code, scan_id) == (130, None)
+    code, scan_id, _ = _scope(["--source", "tenable"], ["2", KeyboardInterrupt()])
+    assert (code, scan_id) == (130, None)
+
+
+def test_a_menu_scan_id_reaches_the_client_the_same_way_the_flag_does():
+    """The menu's only job is to fill in `--scan-id`; downstream sees no seam."""
+    _, scan_id, _ = _scope(["--source", "tenable"], ["2", "58373"])
+    client = TenableClient(access_key="AK", secret_key="SK", scan_id=scan_id)
+    assert client.scan_id == "58373"
 
 
 def test_state_configuration_survives_a_reset():

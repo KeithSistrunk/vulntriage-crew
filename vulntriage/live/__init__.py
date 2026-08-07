@@ -28,9 +28,11 @@ from .http import LiveFetchError
 from .kev import KevClient
 from .nvd import NvdClient, NvdRecord
 from .tenable import TenableAuthError, TenableClient
+from .tenable_csv import CsvSourceError, TenableCsvClient
 
 __all__ = [
     "Cache",
+    "CsvSourceError",
     "EpssClient",
     "EpssScore",
     "LiveFetchError",
@@ -40,6 +42,7 @@ __all__ = [
     "NvdRecord",
     "TenableAuthError",
     "TenableClient",
+    "TenableCsvClient",
 ]
 
 log = logging.getLogger("vulntriage.live")

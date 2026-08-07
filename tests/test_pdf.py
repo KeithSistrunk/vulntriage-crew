@@ -267,6 +267,49 @@ def test_write_reports_emits_the_pdf_with_the_other_three():
             assert path.exists()
 
 
+def test_pdf_only_writes_the_pdf_and_nothing_else():
+    state = _state()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = write_reports(state, tmp, top_n=5, pdf_only=True)
+        assert out.pdf.exists() and out.pdf.read_bytes().startswith(b"%PDF")
+        assert (out.markdown, out.json, out.csv) == (None, None, None)
+        written = sorted(p.name for p in Path(tmp).iterdir())
+        assert written == ["triage_report.pdf"], f"pdf-only wrote {written}"
+
+
+def test_pdf_only_produces_the_same_pdf_as_a_full_run():
+    """The flag drops artifacts; it must not change the one it keeps."""
+    state = _state()
+    with tempfile.TemporaryDirectory() as full, tempfile.TemporaryDirectory() as only:
+        a = write_reports(state, full, top_n=5).pdf.read_bytes()
+        b = write_reports(state, only, top_n=5, pdf_only=True).pdf.read_bytes()
+    # The creation timestamp is the one byte range allowed to differ.
+    assert len(a) == len(b)
+    assert _drawn_text(a).count("CVE") == _drawn_text(b).count("CVE")
+
+
+def test_pdf_only_still_runs_the_narrative_guard():
+    """--strict-narrative decides an exit code from this; an output flag must
+    not be able to switch the project's one safeguard off."""
+    state = _state()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = write_reports(state, tmp, top_n=5, pdf_only=True)
+        assert out.guard is not None
+        assert hasattr(out.guard, "violations")
+
+
+def test_pdf_only_says_where_flagged_claims_went():
+    """The markdown is where violations are annotated. If it was not written,
+    that has to be said -- a silently dropped flag is the failure mode here."""
+    state = _state()
+    state.note("prioritization", "Every finding is on an internet-facing host.")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = write_reports(state, tmp, top_n=5, pdf_only=True)
+        if out.guard.violations:
+            assert any("--pdf-only" in w for w in out.warnings), \
+                "a pdf-only run must not drop guard violations in silence"
+
+
 def test_a_locked_pdf_falls_back_instead_of_losing_the_run():
     """Same contract as the CSV: a PDF open in a viewer holds a lock on Windows."""
     from vulntriage.report import write_with_fallback

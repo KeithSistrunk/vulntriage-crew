@@ -8,6 +8,9 @@ data itself.
 Four artifacts per run: markdown to read, JSON to machine-consume, CSV for the
 spreadsheet, and a PDF to forward (`report_pdf.py` -- structured data only, no
 narrative, because a PDF travels furthest from the run that produced it).
+
+`--pdf-only` (`pdf_only=True`) writes the PDF and nothing else, for the case
+where the forwardable artifact is the whole point. The guard still runs.
 """
 
 from __future__ import annotations
@@ -483,9 +486,16 @@ def write_csv(state: PipelineState, path: str | Path) -> Path:
 
 
 class ReportOutputs(NamedTuple):
-    markdown: Path
-    json: Path
-    csv: Path
+    """What a run wrote. The first three are None under `pdf_only`.
+
+    None means "not asked for", never "failed": a renderer that cannot write
+    raises or falls back to a sibling path, and neither one lands here as a
+    silent None.
+    """
+
+    markdown: Path | None
+    json: Path | None
+    csv: Path | None
     pdf: Path
     warnings: list[str]
     guard: GuardReport
@@ -513,8 +523,16 @@ def write_with_fallback(path: Path, write: Callable[[Path], None]) -> tuple[Path
 
 
 def write_reports(
-    state: PipelineState, output_dir: str | Path, top_n: int = 5
+    state: PipelineState, output_dir: str | Path, top_n: int = 5, pdf_only: bool = False
 ) -> ReportOutputs:
+    """Write the run's artifacts. Four by default, the PDF alone under `pdf_only`.
+
+    `pdf_only` drops the other three renderers, not the guard: the narrative is
+    still checked, because `--strict-narrative` decides the exit code from it and
+    a run that stopped checking its own claims because of an output flag would be
+    a quiet loss of the one safeguard the project has. The flagged claims live in
+    the markdown, so a pdf-only run says so rather than discarding them silently.
+    """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     warnings: list[str] = []
@@ -529,17 +547,26 @@ def write_reports(
             warnings.append(warning)
         return resolved
 
-    md_path = _record(
-        out / "triage_report.md",
-        lambda p: p.write_text(build_markdown(state, top_n, guard), encoding="utf-8"),
-    )
-    json_path = _record(
-        out / "triage_report.json",
-        lambda p: p.write_text(
-            json.dumps(build_json(state, top_n, guard), indent=2), encoding="utf-8"
-        ),
-    )
-    csv_path = _record(out / "triage_report.csv", lambda p: write_csv(state, p))
+    md_path = json_path = csv_path = None
+    if not pdf_only:
+        md_path = _record(
+            out / "triage_report.md",
+            lambda p: p.write_text(build_markdown(state, top_n, guard), encoding="utf-8"),
+        )
+        json_path = _record(
+            out / "triage_report.json",
+            lambda p: p.write_text(
+                json.dumps(build_json(state, top_n, guard), indent=2), encoding="utf-8"
+            ),
+        )
+        csv_path = _record(out / "triage_report.csv", lambda p: write_csv(state, p))
+    elif guard.violations:
+        warnings.append(
+            f"the narrative guard flagged {len(guard.violations)} claim(s), which are "
+            f"normally annotated inline in triage_report.md. --pdf-only did not write "
+            f"it, and the PDF carries no narrative — the flagged claims are listed "
+            f"above and nowhere else."
+        )
     # Imported here rather than at module scope: the PDF renderer pulls in the
     # page-layout machinery, and nothing else in this module needs it.
     from .report_pdf import write_pdf

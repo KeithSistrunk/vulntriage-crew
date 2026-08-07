@@ -7,9 +7,21 @@
     python main.py --provider openai --model gpt-4o-mini
     python main.py --top-n 8 --verbose
     python main.py --source tenable --limit 50    # cap the live pull (default 20)
+    python main.py --source tenable --scan-id 58373   # one scan, no menu
+    python main.py --source csv --input Keith-Scan.csv    # a Tenable CSV export
     python main.py --strict-narrative       # fail the run if the guard flags a claim
 
-Writes `output/triage_report.md` and `output/triage_report.json`.
+`--source tenable` without `--scan-id` asks, at a terminal, whether to pull the
+estate workbench or one scan. Anywhere without a terminal -- scripts/lab_run.ps1,
+CI, a redirected stdin -- it takes the workbench without prompting.
+
+`--source csv` reads a Tenable CSV export from `--input` and samples it exactly
+as a live pull is sampled -- `--min-cvss`, one host per CVE, `--limit`. It needs
+no credentials and makes no network calls. (`--source mock` also reads CSV, but
+straight through: every row, no sampling. That is the difference between the two.)
+
+Writes `output/triage_report.{md,json,csv,pdf}`, or the PDF alone with
+`--pdf-only`.
 
 Every crew run passes through the narrative guard (`vulntriage/guard.py`) before
 the report is written: anything an agent asserts that contradicts the structured
@@ -62,18 +74,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="How many findings get a full remediation write-up (default: 5)")
     parser.add_argument("--offline", action="store_true",
                         help="Run the deterministic pipeline only — no LLM, no CrewAI, no API key")
-    parser.add_argument("--source", choices=["mock", "tenable"], default="mock",
-                        help="Where findings come from: the sample export (default) or a live "
-                             "Tenable pull (needs TENABLE_ACCESS_KEY / TENABLE_SECRET_KEY)")
+    parser.add_argument("--source", choices=["mock", "tenable", "csv"], default="mock",
+                        help="Where findings come from: the sample export (default), a live "
+                             "Tenable pull (needs TENABLE_ACCESS_KEY / TENABLE_SECRET_KEY), or "
+                             "a Tenable CSV export read from --input (no credentials, no "
+                             "network, sampled the same way a live pull is)")
     parser.add_argument("--limit", type=int, default=DEFAULT_FINDING_LIMIT,
-                        help=f"Cap a live Tenable pull at this many distinct CVEs "
+                        help=f"Cap a Tenable pull or CSV export at this many distinct CVEs "
                              f"(default: {DEFAULT_FINDING_LIMIT}, 0 for no cap). Applied at the "
                              f"pull, so nothing beyond the cap is enriched. No effect on "
                              f"--source mock.")
+    parser.add_argument("--scan-id", default=None,
+                        help="Pull one Tenable scan's results (e.g. --scan-id 58373) instead of "
+                             "the estate-wide workbench. Sampling applies either way. Passing it "
+                             "skips the interactive source menu; omitting it at a terminal shows "
+                             "the menu, and anywhere else keeps the workbench.")
     parser.add_argument("--min-cvss", type=float, default=DEFAULT_MIN_CVSS,
-                        help=f"Drop live findings below this CVSS before the cap is applied "
-                             f"(default: {DEFAULT_MIN_CVSS}, 0 for no floor). Lower it if too "
-                             f"few findings survive.")
+                        help=f"Drop Tenable and CSV findings below this CVSS before the cap is "
+                             f"applied (default: {DEFAULT_MIN_CVSS}, 0 for no floor). Lower it "
+                             f"if too few findings survive.")
     parser.add_argument("--live-intel", action="store_true",
                         help="Enrich against live CISA KEV, FIRST EPSS and NVD instead of the "
                              "local CVE database")
@@ -85,6 +104,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Model name, e.g. llama3.1:8b or gpt-4o-mini (default: $LLM_MODEL)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Stream each agent's reasoning and tool calls")
+    parser.add_argument("--pdf-only", action="store_true",
+                        help="Write only output/triage_report.pdf — no markdown, JSON or CSV. "
+                             "The narrative guard still runs, so --strict-narrative is "
+                             "unaffected.")
     parser.add_argument("--strict-narrative", action="store_true",
                         help="Exit 3 if the narrative guard flags an unsupported claim "
                              "(the report is still written). For CI.")
@@ -114,11 +137,17 @@ def print_summary(top_n: int) -> None:
     client = STATE.tenable_client
     if client is not None and getattr(client, "limit", None):
         cap = "capped" if client.truncated else "under the cap"
+        pool = getattr(client, "pool", "workbench")
         print(
             f"Sampled: {len(scored)} distinct CVE(s) at CVSS >= {client.min_cvss} ({cap} at "
-            f"{client.limit}) — {client.plugins_examined} of {client.plugins_seen} workbench "
+            f"{client.limit}) — {client.plugins_examined} of {client.plugins_seen} {pool} "
             f"plugin(s) examined, {client.plugins_below_min_cvss} below the floor."
         )
+        if client.cves_recovered_from_name:
+            print(
+                f"         {client.cves_recovered_from_name} CVE id(s) were read out of the "
+                f"plugin name because the scan carried no CVE reference."
+            )
         if client.hosts_not_sampled:
             print(
                 f"         {client.hosts_not_sampled} further affected host(s) share these "
@@ -135,6 +164,103 @@ def print_summary(top_n: int) -> None:
             f"CVSS {f.effective_cvss:<5}{moved}"
         )
     print()
+
+
+# How many times a mistyped answer is worth re-asking before falling back to the
+# documented default. A prompt that loops forever is its own kind of hang.
+MENU_ATTEMPTS = 3
+
+
+def stdin_is_a_terminal() -> bool:
+    """Is there a human on the other end of stdin?
+
+    lab_run.ps1 redirects stdin from an empty file precisely so that nothing in
+    an unattended run can block on a keystroke, and CI has no console at all.
+    Both answer False here and take the default rather than see a menu. A closed
+    or replaced stream answers False too -- when in doubt, do not prompt.
+    """
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def prompt_scan_id(ask) -> str | None:
+    """Read a scan id from the operator. None means they gave up.
+
+    Blank is re-asked rather than accepted: an empty answer here would fall
+    through to the estate workbench, and quietly pulling the whole estate when
+    someone asked for one scan is exactly the surprise this menu exists to
+    avoid. `TenableClient` still treats "" as no scan id, so a fallback stays
+    correct -- it just has to be announced.
+    """
+    for _ in range(MENU_ATTEMPTS):
+        try:
+            answer = ask("Scan ID: ").strip()
+        except EOFError:
+            return None
+        if answer:
+            return answer
+        print("  A scan ID is required for option 2.", file=sys.stderr)
+    return None
+
+
+def choose_tenable_scope(args: argparse.Namespace, ask=None) -> int:
+    """Ask which Tenable scope to pull when the command line did not say.
+
+    Sets `args.scan_id` in place -- None keeps the estate workbench, a string
+    narrows the pull to that scan -- and returns an exit code, 0 to carry on.
+
+    Three ways to skip the menu entirely, and all three matter: `--source mock`
+    never reaches it, `--scan-id` on the command line has already answered it,
+    and a run with no terminal takes the workbench silently. That last one is
+    the contract with scripts/lab_run.ps1: `--source tenable` alone has always
+    meant the workbench, and it still does when nobody is there to answer.
+    """
+    if args.source != "tenable" or args.scan_id is not None:
+        return 0
+    if not stdin_is_a_terminal():
+        return 0
+    # Resolved here rather than as a default argument, which would bind the
+    # builtin at import time and leave the prompt unreachable to a caller.
+    ask = ask or input
+
+    print()
+    print("Tenable source:")
+    print("  1. Estate scan (full workbench)")
+    print("  2. Scan by ID")
+    print()
+
+    for _ in range(MENU_ATTEMPTS):
+        try:
+            choice = ask("Select 1 or 2 [1]: ").strip()
+        except EOFError:
+            # stdin ended mid-prompt. Not a cancellation -- take the default.
+            print()
+            return 0
+        except KeyboardInterrupt:
+            # Ctrl+C at a menu means "get me out", not "use the default".
+            print("\nCancelled.", file=sys.stderr)
+            return 130
+
+        if choice in ("", "1"):
+            return 0
+        if choice == "2":
+            try:
+                scan_id = prompt_scan_id(ask)
+            except KeyboardInterrupt:
+                print("\nCancelled.", file=sys.stderr)
+                return 130
+            if scan_id is None:
+                print("  No scan ID given — pulling the estate workbench instead.",
+                      file=sys.stderr)
+                return 0
+            args.scan_id = scan_id
+            return 0
+        print("  Not an option. Enter 1 or 2.", file=sys.stderr)
+
+    print("  Falling back to the estate workbench.", file=sys.stderr)
+    return 0
 
 
 def configure_sources(args: argparse.Namespace) -> int:
@@ -180,7 +306,9 @@ def configure_sources(args: argparse.Namespace) -> int:
     if args.source == "tenable":
         from vulntriage.live import TenableClient
 
-        client = TenableClient(limit=args.limit, min_cvss=args.min_cvss)
+        client = TenableClient(
+            limit=args.limit, min_cvss=args.min_cvss, scan_id=args.scan_id
+        )
         if not client.configured:
             print(
                 "--source tenable needs TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY.\n"
@@ -188,7 +316,25 @@ def configure_sources(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        print(f"Findings source: Tenable ({client.flavor}) at {client.base_url}")
+        scope = f"scan {client.scan_id}" if client.scan_id else "estate workbench"
+        print(f"Findings source: Tenable ({client.flavor}) at {client.base_url} — {scope}")
+
+    elif args.source == "csv":
+        from vulntriage.live import TenableCsvClient
+
+        client = TenableCsvClient(
+            args.input, limit=args.limit, min_cvss=args.min_cvss
+        )
+        if not client.configured:
+            print(
+                f"--source csv needs --input pointing at a Tenable CSV export.\n"
+                f"  Not a readable file: {client.path}",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"Findings source: Tenable CSV export — {client.path}")
+
+    if client is not None:
         floor = f"CVSS >= {client.min_cvss}" if client.min_cvss else "no CVSS floor"
         if client.limit:
             print(f"  Sampling: {floor}, one host per CVE, most severe first, "
@@ -202,7 +348,23 @@ def configure_sources(args: argparse.Namespace) -> int:
     asset_index: dict = {}
     if client is not None:
         asset_index = client.fetch_asset_contexts()
-        if asset_index:
+        if args.source == "csv":
+            # A CSV export has no ACR column, so this is identity only. Saying
+            # "asset criticality" here would claim a join the file cannot make.
+            # Nothing at all usually means the file is not what it was taken for,
+            # and the pull is about to say so properly.
+            if asset_index:
+                print(
+                    f"Asset context: {len(asset_index)} identities from the export "
+                    f"(no criticality — a CSV export carries no ACR)"
+                )
+            else:
+                print(
+                    "WARNING: no host identities read from the export — check it has a Host,\n"
+                    "  FQDN or IP Address column.",
+                    file=sys.stderr,
+                )
+        elif asset_index:
             print(f"Asset criticality: {len(asset_index)} identities from Tenable ACR")
         else:
             print(
@@ -282,11 +444,28 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     input_path = Path(args.input)
-    # A live Tenable pull does not read the sample file, so only require it when
-    # the mock source is actually in play.
-    if args.source == "mock" and not input_path.exists():
+    # A live Tenable pull does not read a file at all; --source csv reads the one
+    # --input names. Only the API source can do without it.
+    if args.source in ("mock", "csv") and not input_path.exists():
         print(f"Findings file not found: {input_path}", file=sys.stderr)
         return 1
+    # The default input is the sample JSON, so `--source csv` with no --input is
+    # a command that cannot mean what it says. Catch it here rather than letting
+    # the parser fail halfway through a file it was never handed.
+    if args.source == "csv" and input_path.suffix.lower() != ".csv":
+        print(
+            f"--source csv expects a Tenable CSV export; --input is {input_path.name}.\n"
+            f"  Pass the export, e.g. --source csv --input Keith-Scan.csv. To triage a "
+            f"JSON export unsampled, use --source mock.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Before anything is configured or fetched: a menu that appeared after the
+    # credential check or an asset pull would be a menu you wait for.
+    code = choose_tenable_scope(args)
+    if code:
+        return code
 
     code = configure_sources(args)
     if code:
@@ -295,6 +474,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.offline:
             origin = "Tenable" if args.source == "tenable" else str(input_path)
+            if args.source == "csv":
+                origin = f"{input_path} (Tenable CSV export)"
             print(f"Running the deterministic pipeline on {origin} (no LLM).")
             run_offline(input_path, STATE)
         else:
@@ -314,9 +495,16 @@ def main(argv: list[str] | None = None) -> int:
                 "  sample export instead.",
                 file=sys.stderr,
             )
+        if args.source == "csv":
+            print(
+                "  Check that the file is a Tenable CSV export with 'Plugin ID' and 'CVE'\n"
+                "  columns. Run with --source mock to read it as a plain scanner export\n"
+                "  instead, which skips the sampling.",
+                file=sys.stderr,
+            )
         return 2
 
-    outputs = write_reports(STATE, args.output_dir, args.top_n)
+    outputs = write_reports(STATE, args.output_dir, args.top_n, pdf_only=args.pdf_only)
 
     # Same lock fallback as the three reports: an unattended run must not lose its
     # state file to an editor holding a handle on it.
@@ -325,10 +513,17 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print_summary(args.top_n)
-    print(f"Report:  {outputs.markdown}")
-    print(f"JSON:    {outputs.json}")
-    print(f"CSV:     {outputs.csv}  ({len(STATE.scored)} rows, one per finding)")
+    # Only what was actually written gets a line. Printing a path for a file the
+    # run deliberately did not produce is worse than printing nothing.
+    if outputs.markdown:
+        print(f"Report:  {outputs.markdown}")
+    if outputs.json:
+        print(f"JSON:    {outputs.json}")
+    if outputs.csv:
+        print(f"CSV:     {outputs.csv}  ({len(STATE.scored)} rows, one per finding)")
     print(f"PDF:     {outputs.pdf}  (structured data only — no agent narrative)")
+    if args.pdf_only:
+        print("         --pdf-only: markdown, JSON and CSV were not written.")
     print(f"State:   {state_path}")
 
     if STATE.live is not None:
@@ -340,10 +535,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"           {violation.stage}: {violation.code} {violation.check} — "
               f"{violation.message}")
     if guard.violations:
+        where = (
+            "They are listed above and nowhere else, because --pdf-only did not write "
+            "the markdown they are normally flagged in"
+            if args.pdf_only
+            else "They are flagged inline in the report"
+        )
         print(
             "\nWARNING: the narrative contradicts the structured data in the places "
-            "listed above. They are flagged inline in the report; the findings, "
-            "scores and remediation steps are unaffected.",
+            f"listed above. {where}; the findings, scores and remediation steps are "
+            "unaffected.",
             file=sys.stderr,
         )
 

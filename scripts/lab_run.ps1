@@ -13,7 +13,10 @@
       - keeps the Arc iGPU enabled (OLLAMA_IGPU_ENABLE=1), which Ollama otherwise
         drops, silently falling back to CPU
       - blocks every interactive path: stdin is EOF, CrewAI tracing and telemetry
-        are off. Nothing can sit waiting for a keystroke that will never come
+        are off. Nothing can sit waiting for a keystroke that will never come.
+        main.py's Tenable source menu is part of that contract -- it only appears
+        when stdin is a real terminal, so an unattended run takes the estate
+        workbench silently. -ScanId narrows it to one scan without a prompt
       - timestamped log per run under logs\
       - file locks never lose a run: main.py writes beside a locked file instead
 
@@ -28,6 +31,8 @@
     .\scripts\lab_run.ps1 -Model llama3.1:8b -TopN 8 -OutputDir output-lab
     .\scripts\lab_run.ps1 -FindingsPath data\sample_findings.csv -FallbackOffline
     .\scripts\lab_run.ps1 -StreamAgents     # stream each agent's reasoning into the log
+    .\scripts\lab_run.ps1 -Source tenable -ScanId 58373   # one scan, unattended
+    .\scripts\lab_run.ps1 -Source csv -FindingsPath Keith-Scan.csv   # a Tenable export
 #>
 [CmdletBinding()]
 param(
@@ -36,6 +41,11 @@ param(
     [string]$OutputDir,
     [string]$Model,
     [int]$TopN,
+    [ValidateSet('mock', 'tenable', 'csv')]
+    [string]$Source,
+    # The unattended answer to main.py's source menu, which this script never
+    # sees: with it, one scan; without it, the estate workbench.
+    [string]$ScanId,
     [switch]$Strict,
     # Not -Verbose: CmdletBinding already claims that for Write-Verbose.
     [switch]$StreamAgents,
@@ -151,6 +161,12 @@ if ($offline)                          { $pyArgs += '--offline' }
 if ($FindingsPath)                     { $pyArgs += @('--input', $FindingsPath) }
 if ($OutputDir)                        { $pyArgs += @('--output-dir', $OutputDir) }
 if ($TopN)                             { $pyArgs += @('--top-n', "$TopN") }
+# A scan id is only meaningful against Tenable, so asking for one says which
+# source you meant. Without it, --source tenable defaults to the workbench --
+# the menu cannot appear here, because stdin is not a terminal.
+if ($ScanId -and -not $Source)         { $Source = 'tenable' }
+if ($Source)                           { $pyArgs += @('--source', $Source) }
+if ($ScanId)                           { $pyArgs += @('--scan-id', $ScanId) }
 if ($Model -and -not $offline)         { $pyArgs += @('--model', $Model) }
 if ($Strict)                           { $pyArgs += '--strict-narrative' }
 if ($StreamAgents)                     { $pyArgs += '--verbose' }

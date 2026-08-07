@@ -52,6 +52,63 @@ That inversion is the whole product. Everything else is plumbing.
 
 ---
 
+## Validated against live data
+
+The sample export above is the quick-start demo: small, deterministic, and backed
+by a hand-curated CVE database. The same pipeline has also been run against a
+real Tenable scan of a live Windows host — 198 rows, 172 plugins — sampled to 20
+distinct CVEs and enriched against CISA KEV, FIRST EPSS and NVD:
+
+```bash
+python main.py --source csv --input Keith-Scan.csv --limit 20 --live-intel
+```
+
+**Live intel escalates.** Without it, all 20 findings scored P4 inside a
+nine-point band: not one of these CVEs is in the local database, so every exploit
+weight was a neutral ×1.00 and the ranking was a CVSS sort wearing a hat. With
+KEV and EPSS attached, seven findings promoted to P3:
+
+| CVE | Baseline | Live | Why |
+|---|---:|---:|---|
+| CVE-2013-3900 (WinVerifyTrust) | 29.3 | **46.9** | KEV-listed, EPSS 44.6% |
+| CVE-2023-31102 (7-Zip) | 26.0 | **41.6** | EPSS 71.0%, *not* KEV-listed |
+| CVE-2026-45498 (Defender) | 25.0 | **40.0** | KEV-listed, EPSS 63.1% |
+
+CVE-2013-3900 arriving at the top is the result worth looking at: a 2013
+signature-validation weakness that a CVSS sort buries beneath four higher-scored
+2023–2026 findings, and that CISA lists as exploited in the wild.
+
+**The inversion holds on real data.** CVE-2026-45498 at **CVSS 7.5** outranks
+CVE-2023-52168 at **CVSS 8.4** — 40.0 against 28.0. Both sit on the same host, so
+asset criticality and exposure are identical and cancel out: the entire
+difference is that one is exploited in the wild and the other has an EPSS of 0.3%.
+
+**Live intel de-escalates too, and that matters just as much.** NVD is
+authoritative on CVSS, and it corrected the scanner *downward* on five of the
+twenty — three of them sharply:
+
+| CVE | Tenable | NVD | Risk score |
+|---|---:|---:|---:|
+| CVE-2023-40036 (Notepad++) | 7.8 | **5.5** | 26.0 → 18.3 |
+| CVE-2023-40164 (Notepad++) | 7.8 | **5.5** | 26.0 → 18.3 |
+| CVE-2023-40166 (Notepad++) | 7.8 | **5.5** | 26.0 → 18.3 |
+
+plus CVE-2023-52169 (8.4 → 8.2) and CVE-2026-48101 (7.1 → 6.5). A triage tool
+that only ever raised priorities would be one nobody could act on — the queue has
+to shrink at the bottom as well as grow at the top.
+
+The narrative guard passed the live run clean (4 stages, no unsupported claims),
+having flagged two fabricated effort estimates on the same data without intel.
+
+**One honest limit.** Nothing reached P2, and that is structural rather than
+reassuring: a CSV export carries no Asset Criticality Rating, so every finding
+scores at the neutral ×1.00 asset weight and the reachable maximum is 53.3
+(CVSS 10.0 × 1.60 exploited ÷ 30) against a P2 threshold of 55.0. Priority bands
+on this path describe the *vulnerabilities*, not the business. `--source tenable`
+reads Tenable's ACR and restores the asset dimension.
+
+---
+
 ## Run it without an LLM
 
 The data pipeline is deterministic, so you can see the whole thing work before
@@ -126,6 +183,19 @@ Every run writes four artifacts to `output/`:
 | `triage_report.csv` | spreadsheets and ticket imports — one row per finding |
 | `triage_report.pdf` | forwarding — every finding with CVE, CVSS, host, priority and remediation |
 
+`--pdf-only` writes the PDF and nothing else, for when the forwardable artifact
+is the whole point:
+
+```bash
+python main.py --source tenable --scan-id 58373 --offline --pdf-only
+```
+
+The PDF is byte-for-byte what a full run would have produced — the flag drops
+artifacts, it does not change the one it keeps. The narrative guard still runs,
+so `--strict-narrative` still decides the exit code; because the markdown it
+normally annotates was not written, a pdf-only run that flags a claim says so on
+stderr rather than dropping it silently.
+
 **The PDF contains no agent narrative at all.** It is rendered from the same
 deterministic state as the CSV — scanner output, CVE intelligence, asset
 inventory — and never from `agent_notes`. A PDF is the artifact that travels
@@ -147,15 +217,18 @@ python main.py --offline --live-intel          # real KEV + EPSS + NVD, mock fin
 python main.py --source tenable --live-intel   # everything live
 python main.py --source tenable --limit 50     # widen the 20-CVE sample
 python main.py --source tenable --min-cvss 4   # lower the floor if too little survives
+python main.py --source csv --input Keith-Scan.csv   # a Tenable CSV export, no keys
 python main.py --offline                       # unchanged: pure mock, no network
 ```
 
 | Flag | Effect |
 |---|---|
 | `--source mock` *(default)* | findings from `data/sample_findings.json` |
-| `--source tenable` | findings pulled from the Tenable API |
-| `--limit N` *(default 20)* | sample a live pull down to N distinct CVEs; `0` lifts the cap |
-| `--min-cvss X` *(default 7.0)* | drop live findings below CVSS X before the cap; `0` lifts the floor |
+| `--source tenable` | findings pulled from the Tenable API (estate workbench by default) |
+| `--source csv` | findings read from the Tenable CSV export named by `--input` — no keys, no network |
+| `--scan-id N` | pull one scan's results (`/scans/{id}`) instead of the workbench; also skips the source menu |
+| `--limit N` *(default 20)* | sample a pull or an export down to N distinct CVEs; `0` lifts the cap |
+| `--min-cvss X` *(default 7.0)* | drop findings below CVSS X before the cap; `0` lifts the floor |
 | `--live-intel` | enrich against CISA KEV, FIRST EPSS and NVD instead of `cve_db.json` |
 | `--no-cache` | bypass the on-disk intel cache and re-fetch |
 
@@ -185,6 +258,112 @@ CVE (the rest are counted, not listed), and the sample is the severe end of the
 estate, not a survey of it. `--limit 0` lifts both the cap and the one-host-per-CVE
 dedupe for a real run; `--min-cvss` is its own filter and applies either way.
 `--source mock` ignores both flags entirely.
+
+### A CSV export instead of the API
+
+```bash
+python main.py --source csv --input Keith-Scan.csv
+python main.py --source csv --input Keith-Scan.csv --limit 0 --min-cvss 4
+```
+
+A Tenable CSV export is what people actually have. Handing one over costs nobody
+an API key, and it is the only way to triage an estate you can no longer reach —
+an old scan, a customer's export, a scan someone else ran.
+
+`--source csv` reads the columns the API client already normalizes — CVE, CVSS3
+Base Score, Risk, Host, FQDN, Name, Solution, plus port, protocol, state and
+plugin output — under whichever of Tenable's several spellings the export uses
+(`CVSS3 Base Score` and `CVSS v3.0 Base Score` are both read, as are `Risk` and
+`Risk Factor`, `Host` and `DNS Name`).
+
+**It is sampled by exactly the code a live pull is sampled by.** `TenableCsvClient`
+subclasses the API client and overrides only the three seams the sampling loop
+reads — which plugins exist, what a plugin's CVEs and score are, which hosts
+report it. The floor, the one-CVE-once dedupe, the one-host-per-CVE pick and the
+cap are inherited, not reimplemented, so the two sources cannot drift about what
+a report covers. `--limit`, `--min-cvss` and `--limit 0` mean the same thing here
+as they do above, and the run summary and report anomalies declare the sample the
+same way.
+
+Two things are specific to a file source:
+
+- **A CSV export carries no Asset Criticality Rating.** The API path reads
+  Tenable's ACR and bands it into the risk model's criticality; an export has no
+  such column, so findings stay flagged as an intel gap and score at the neutral
+  asset weight rather than on an invented rating. Identity and OS still come from
+  the file, so findings reconcile across FQDN, NetBIOS name and IP.
+- **An export writes one row per (plugin, CVE)**, so a four-CVE plugin on one box
+  is four rows describing one instance. Those are folded back into one instance
+  before sampling — otherwise the report would claim three affected hosts that do
+  not exist.
+
+`Solution` has no equivalent in the API's workbench response, so it is the one
+field the export knows that a live pull does not. Where the local intel database
+has no entry for a CVE, that text becomes the baseline remediation instead of
+"no vendor guidance on file" — labelled as the scanner's words, with the effort
+left unscoped, because a one-line fix string is a head start and not an approved
+change plan.
+
+**`--source mock` also reads CSV, and stays exactly as it was:** every row, no
+floor, no cap, no dedupe. That difference is the whole reason `--source csv`
+exists — one is "parse this file", the other is "sample this estate".
+
+### One scan instead of the estate
+
+```bash
+python main.py --source tenable --scan-id 58373
+```
+
+`--scan-id` reads `/scans/{id}` and its host and plugin detail instead of the
+workbench. The scan payloads are translated into the workbench's shapes on the
+way in, so the sampling, the normalizer and the risk model are the same code on
+both paths — only the three endpoints differ. Without the flag, nothing changes.
+
+**At a terminal, `--source tenable` without `--scan-id` asks which one you
+want:**
+
+```
+Tenable source:
+  1. Estate scan (full workbench)
+  2. Scan by ID
+
+Select 1 or 2 [1]:
+```
+
+Option 1 is the workbench pull as before; option 2 prompts for the ID and then
+behaves exactly as `--scan-id` would — the menu's only job is to fill that flag
+in, and nothing downstream can tell which way it was set.
+
+The menu appears in exactly one situation, and the exclusions are the point:
+
+| Situation | What happens |
+|---|---|
+| `--source tenable`, no `--scan-id`, a terminal | the menu |
+| `--scan-id N` passed | that scan, no menu |
+| No terminal — `scripts/lab_run.ps1`, CI, redirected stdin | the estate workbench, no menu |
+| `--source mock` | unchanged, never asked |
+
+An unattended run must never meet a prompt, so the check is for a real terminal
+on stdin rather than for anything the caller has to remember to pass.
+`scripts/lab_run.ps1` already redirects stdin from an empty file and now also
+takes `-ScanId`; `--source tenable` alone still means the workbench there, as it
+always has. Ctrl+C at the menu exits 130 without running anything.
+
+Two things the real API forced, both specific to scan mode:
+
+- **A scan summary carries no CVSS, only a severity.** Applying the CVSS floor
+  would otherwise mean a detail call per plugin — 153 of them on the test scan,
+  135 informational — and Tenable rate-limits those endpoints hard enough to
+  fail the pull with HTTP 429. So a scan pull floors on the severity *band's
+  ceiling* first, which is free, and only then pays for the detail call: 153
+  plugins down to 6 calls. The workbench keeps judging on the authoritative
+  score, because it has one and is not throttled the same way.
+- **The scan detail returns `ref_information: null`** for every plugin on this
+  instance, while Tenable puts the id in the plugin name
+  (`... CVE-2021-34527 OOB Security Update RCE`). Discovery already recovers
+  those, so the pull does too — otherwise it would drop findings the normalizer
+  would have kept. Recovered ids are counted and declared in the report, because
+  an inferred identifier is not one the scanner asserted.
 
 ### Keys
 

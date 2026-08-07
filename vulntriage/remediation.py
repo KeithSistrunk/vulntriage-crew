@@ -20,9 +20,20 @@ EFFORT_RANK = {"low": 1, "medium": 2, "high": 3}
 
 
 def remediation_for(finding: ScoredFinding) -> dict:
-    """Baseline remediation plan for one finding, drawn from the intel DB."""
+    """Baseline remediation plan for one finding.
+
+    The curated intel database first, the scanner's own `Solution` text second
+    (a CSV export carries one; the API does not), a research task last.
+    """
     rem = finding.intel.remediation or {}
     effort = rem.get("effort", "unknown")
+
+    # The curated database first, the scanner's own fix text second, a research
+    # task last. A CSV export usually carries a `Solution` column, and printing
+    # "no vendor guidance on file" next to a finding whose export said "upgrade
+    # to 7-Zip 26.01" is throwing away the one thing the scanner knew.
+    if not rem and _scanner_fix(finding):
+        return _from_scanner(finding)
 
     if not rem:
         return {
@@ -58,6 +69,43 @@ def remediation_for(finding: ScoredFinding) -> dict:
         "change_risk": rem.get("change_risk", "unknown"),
         "window": finding.asset.maintenance_window,
         "constraints": _constraints(finding),
+    }
+
+
+def _scanner_fix(finding: ScoredFinding) -> str:
+    """The scanner's own remediation text, flattened to one line."""
+    return " ".join((finding.solution or "").split())
+
+
+def _from_scanner(finding: ScoredFinding) -> dict:
+    """Baseline plan built from the export's `Solution` column.
+
+    Deliberately not dressed up as curated guidance: the effort stays unscoped
+    and the reboot/downtime questions stay open, because a scanner's one-line
+    fix text answers none of them. It is a real head start on the research task
+    it replaces, and the summary says whose words they are so nobody mistakes a
+    plugin string for an approved change plan.
+    """
+    fix = _scanner_fix(finding)
+    return {
+        "summary": f"Scanner-reported fix for {finding.cve}: {fix}",
+        "steps": [
+            f"Confirm {finding.cve} applies to the installed version on {finding.hostname}.",
+            f"Apply the scanner's remediation: {fix}",
+            "Check the vendor advisory for prerequisites, reboots and known regressions.",
+            "Schedule the change and re-scan to confirm the plugin no longer fires.",
+        ],
+        "type": "patch",
+        "effort": "unknown",
+        "effort_hours": "unknown - scope against the vendor advisory",
+        "requires_reboot": None,
+        "requires_downtime": None,
+        "change_risk": "unknown",
+        "window": finding.asset.maintenance_window,
+        "constraints": _constraints(finding) + [
+            "Fix text is the scanner's, not the local intel database's - confirm it "
+            "against the vendor advisory before it goes in a change record."
+        ],
     }
 
 
