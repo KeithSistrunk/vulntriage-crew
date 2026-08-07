@@ -34,3 +34,12 @@ db/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Personal notes, not portfolio material
+*.docx
+
+# Real scanner exports. `--source csv` reads these, and they carry live estate
+# detail -- hostnames, addresses, OS versions, open ports, unpatched plugins.
+# The sample export under data/ is the only findings file this repo commits.
+*-Scan*.csv
+scans/
