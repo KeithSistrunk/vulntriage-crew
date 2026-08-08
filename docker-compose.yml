@@ -1,0 +1,79 @@
+# VulnTriage Crew -- app + local LLM.
+#
+#   docker compose run --rm --no-deps vulntriage     # mock + offline, no LLM
+#   docker compose run --rm vulntriage --verbose     # the four-agent crew
+#
+# The app is a batch job, not a server: it runs, writes four artifacts to
+# ./output on the host, and exits. `run --rm` is therefore the normal verb here,
+# not `up`.
+
+services:
+  ollama:
+    image: ollama/ollama
+    container_name: vulntriage-ollama
+    ports:
+      # Published so `ollama list` / `ollama pull` from the host talk to this
+      # instance too. Drop this line if a host Ollama already owns the port.
+      - "11434:11434"
+    volumes:
+      # Named, not a bind mount: models are gigabytes of cache, not project
+      # files, and they must survive `docker compose down` without landing in
+      # the repo.
+      - ollama-models:/root/.ollama
+    healthcheck:
+      # The image ships the `ollama` binary, so this needs no curl in the image.
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    # Uncomment for an NVIDIA GPU. Without it Ollama runs on CPU, which is
+    # workable for an 8B model but slow.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  vulntriage:
+    build: .
+    image: vulntriage-crew
+    container_name: vulntriage-app
+    depends_on:
+      ollama:
+        # The crew path cannot start before the backend answers. The default
+        # mock/offline run does not need Ollama at all -- use `--no-deps` to
+        # skip the wait entirely.
+        condition: service_healthy
+    env_file:
+      # Keys come from the host at run time and are never baked into the image
+      # (.dockerignore excludes .env from the build context). `required: false`
+      # so a fresh clone with no .env still runs -- needs Compose v2.24+.
+      - path: .env
+        required: false
+    environment:
+      # Set here rather than in .env because it must win: inside the network the
+      # LLM is `ollama`, not localhost. Process environment beats .env by
+      # design (vulntriage/config.py loads dotenv without override), so this
+      # overrides whatever the host's .env says.
+      #
+      # Expect a "differ between .env and your shell environment" warning on
+      # startup when the host .env pins localhost. That warning is correct and
+      # this is the value being used.
+      OLLAMA_BASE_URL: http://ollama:11434
+      # CrewAI's telemetry exporter blocks for 30s per batch when it cannot
+      # reach telemetry.crewai.com, which in a sealed container is every batch.
+      CREWAI_DISABLE_TELEMETRY: "true"
+      CREWAI_TELEMETRY_OPT_OUT: "true"
+      OTEL_SDK_DISABLED: "true"
+    volumes:
+      # The reports outlive the container. Host-side ./output is where the
+      # markdown, JSON, CSV and PDF land.
+      - ./output:/app/output
+    # Inherited from the image: `python main.py --source mock --offline`.
+    # Anything appended to `docker compose run vulntriage` replaces those flags.
+
+volumes:
+  ollama-models:

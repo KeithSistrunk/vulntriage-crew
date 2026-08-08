@@ -1,0 +1,69 @@
+# Mirrors .gitignore, plus the things git tracks but a runtime image has no use
+# for. Two jobs: keep secrets and host state out of the build context, and keep
+# the context small enough that a rebuild is fast.
+
+# A note on `**/`, because it is the difference between these rules working and
+# only appearing to: .dockerignore is NOT .gitignore. A pattern here is matched
+# against the whole path from the context root, so bare `__pycache__/` excludes
+# only the one at the root and lets `vulntriage/__pycache__/` straight through
+# into the image. Anything that can appear at any depth needs `**/`.
+
+# Secrets -- .env.example documents the shape and is harmless; .env is not.
+.env
+**/*.pem
+**/*.key
+
+# Environments
+.venv/
+venv/
+env/
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.pytest_cache/
+
+# Generated reports (including --output-dir variants and lock fallbacks)
+output/
+output_*/
+triage_report-*.csv
+
+# Run logs
+logs/
+
+# Live intel cache (KEV catalogue, EPSS scores, NVD records) -- host state, and
+# stale by the time the image is pulled
+.cache/
+
+# CrewAI local artifacts
+.crewai/
+db/
+**/*.db
+**/*.log
+
+# Real scanner exports. `--source csv` reads these from anywhere on disk, and a
+# copy left in the repo is live estate detail -- the same rule .gitignore holds.
+*-Scan*.csv
+scans/
+
+# Version control and tooling
+.git/
+.gitignore
+.github/
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Repo material with no runtime role. The Dockerfile COPYs explicitly, so these
+# are belt and braces -- and they keep the build context off the docs/ image.
+docs/
+tests/
+scripts/
+*.md
+*.docx
+Dockerfile
+docker-compose.yml
+.dockerignore
